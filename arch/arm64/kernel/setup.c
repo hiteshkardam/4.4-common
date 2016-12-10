@@ -40,6 +40,7 @@
 #include <linux/proc_fs.h>
 #include <linux/memblock.h>
 #include <linux/of_iommu.h>
+#include <linux/of_address.h>
 #include <linux/of_fdt.h>
 #include <linux/of_platform.h>
 #include <linux/efi.h>
@@ -412,7 +413,189 @@ static int dump_kernel_offset(struct notifier_block *self, unsigned long v,
 	} else {
 		pr_emerg("Kernel Offset: disabled\n");
 	}
+	
 	return 0;
+}
+
+#ifdef CONFIG_COMPAT
+static const char *compat_hwcap_str[] = {
+	"swp",
+	"half",
+	"thumb",
+	"26bit",
+	"fastmult",
+	"fpa",
+	"vfp",
+	"edsp",
+	"java",
+	"iwmmxt",
+	"crunch",
+	"thumbee",
+	"neon",
+	"vfpv3",
+	"vfpv3d16",
+	"tls",
+	"vfpv4",
+	"idiva",
+	"idivt",
+	"vfpd32",
+	"lpae",
+	"evtstrm",
+	NULL
+	};
+
+static const char *compat_hwcap2_str[] = {
+	"aes",
+	"pmull",
+	"sha1",
+	"sha2",
+	"crc32",
+	NULL
+	};
+
+#endif /* CONFIG_COMPAT */
+
+static u32 cx_fuse_data = 0x0;
+static u32 mx_fuse_data = 0x0;
+
+static const u32 vddcx_pvs_retention_data[8] =
+{
+   600000,
+   550000,
+   500000,
+   450000,
+   400000,
+   400000, 
+   400000, 
+   600000
+};
+
+static const u32 vddmx_pvs_retention_data[8] =
+{
+   700000,
+   650000,
+   580000,
+   550000,
+   490000,
+   490000,
+   490000,
+   490000
+};
+
+static int read_cx_fuse_setting(void){
+	if(cx_fuse_data != 0x0)
+		
+		return ((cx_fuse_data & (0x7 << 29)) >> 29);
+	else
+		return -ENOMEM;
+}
+
+static int read_mx_fuse_setting(void){
+	if(mx_fuse_data != 0x0)
+		
+		return ((mx_fuse_data & (0x7 << 2)) >> 2);
+	else
+		return -ENOMEM;
+}
+
+static u32 Get_min_cx(void) {
+	u32 lookup_val = 0;
+	int mapping_data;
+	mapping_data = read_cx_fuse_setting();
+	if(mapping_data >= 0)
+		lookup_val = vddcx_pvs_retention_data[mapping_data];
+	return lookup_val;
+}
+
+static u32 Get_min_mx(void) {
+	u32 lookup_val = 0;
+	int mapping_data;
+	mapping_data = read_mx_fuse_setting();
+	if(mapping_data >= 0)
+		lookup_val = vddmx_pvs_retention_data[mapping_data];
+	return lookup_val;
+}
+
+extern u64* htc_target_quot[2];
+extern int htc_target_quot_len;
+static int c_show(struct seq_file *m, void *v)
+{
+	int i, j, size;
+
+	seq_printf(m, "Processor\t: %s rev %d (%s)\n",
+		cpu_name, read_cpuid_id() & 15, ELF_PLATFORM);
+	for_each_present_cpu(i) {
+		struct cpuinfo_arm64 *cpuinfo = &per_cpu(cpu_data, i);
+		u32 midr = cpuinfo->reg_midr;
+
+		/*
+		 * glibc reads /proc/cpuinfo to determine the number of
+		 * online processors, looking for lines beginning with
+		 * "processor".  Give glibc what it expects.
+		 */
+#ifdef CONFIG_SMP
+		seq_printf(m, "processor\t: %d\n", i);
+#endif
+		seq_printf(m, "min_vddcx\t: %d\n", Get_min_cx());
+		seq_printf(m, "min_vddmx\t: %d\n", Get_min_mx());
+
+		seq_printf(m, "BogoMIPS\t: %lu.%02lu\n",
+			   loops_per_jiffy / (500000UL/HZ),
+			   loops_per_jiffy / (5000UL/HZ) % 100);
+
+		/*
+		 * Dump out the common processor features in a single line.
+		 * Userspace should read the hwcaps with getauxval(AT_HWCAP)
+		 * rather than attempting to parse this, but there's a body of
+		 * software which does already (at least for 32-bit).
+		 */
+		seq_puts(m, "Features\t:");
+		if (personality(current->personality) == PER_LINUX32) {
+#ifdef CONFIG_COMPAT
+			for (j = 0; compat_hwcap_str[j]; j++)
+				if (compat_elf_hwcap & (1 << j))
+					seq_printf(m, " %s", compat_hwcap_str[j]);
+
+			for (j = 0; compat_hwcap2_str[j]; j++)
+				if (compat_elf_hwcap2 & (1 << j))
+					seq_printf(m, " %s", compat_hwcap2_str[j]);
+#endif /* CONFIG_COMPAT */
+		} else {
+			for (j = 0; hwcap_str[j]; j++)
+				if (elf_hwcap & (1 << j))
+					seq_printf(m, " %s", hwcap_str[j]);
+		}
+		seq_puts(m, "\n");
+
+		seq_printf(m, "CPU implementer\t: 0x%02x\n",
+			   MIDR_IMPLEMENTOR(midr));
+		seq_printf(m, "CPU architecture: 8\n");
+		seq_printf(m, "CPU variant\t: 0x%x\n", MIDR_VARIANT(midr));
+		seq_printf(m, "CPU part\t: 0x%03x\n", MIDR_PARTNUM(midr));
+		seq_printf(m, "CPU revision\t: %d\n", MIDR_REVISION(midr));
+
+		if (!arch_read_hardware_id)
+			seq_printf(m, "Hardware\t: %s\n", machine_name);
+		else
+			seq_printf(m, "Hardware\t: %s\n", arch_read_hardware_id());
+
+		seq_puts(m, "\n");
+	}
+	size = sizeof(htc_target_quot)/sizeof(u64);
+	seq_printf(m, "CPU param\t: ");
+	for (i = 0; i < size; i++) {
+		if(htc_target_quot[i]) {
+			for(j = 0; j < htc_target_quot_len; j++)
+				seq_printf(m, "%lld ", htc_target_quot[i][j]);
+		}
+	}
+	seq_printf(m, "\n: ");
+
+	if (!arch_read_hardware_id)
+		seq_printf(m, "Hardware\t: %s\n", machine_name);
+	else
+		seq_printf(m, "Hardware\t: %s\n", arch_read_hardware_id());
+			return 0;
 }
 
 static struct notifier_block kernel_offset_notifier = {
@@ -426,3 +609,39 @@ static int __init register_kernel_offset_dumper(void)
 	return 0;
 }
 __initcall(register_kernel_offset_dumper);
+static int msm8996_read_cx_fuse(void){
+	void __iomem *addr;
+	struct device_node *dn = of_find_compatible_node(NULL,
+						NULL, "qcom,cpucx-8996");
+	if (dn && (cx_fuse_data == 0x0)) {
+		addr = of_iomap(dn, 0);
+		if (!addr)
+			return -ENOMEM;
+		cx_fuse_data = readl_relaxed(addr);
+		iounmap(addr);
+	}
+	else {
+		return -ENOMEM;
+	}
+	return 0;
+}
+arch_initcall_sync(msm8996_read_cx_fuse);
+
+static int msm8996_read_mx_fuse(void){
+	void __iomem *addr;
+	struct device_node *dn = of_find_compatible_node(NULL,
+						NULL, "qcom,cpumx-8996");
+	if (dn && (mx_fuse_data == 0x0)) {
+		addr = of_iomap(dn, 0);
+		if (!addr)
+			return -ENOMEM;
+		mx_fuse_data = readl_relaxed(addr);
+		iounmap(addr);
+	}
+	else {
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+arch_initcall_sync(msm8996_read_mx_fuse);
