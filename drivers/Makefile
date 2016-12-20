@@ -166,9 +166,18 @@ obj-$(CONFIG_MCB)		+= mcb/
 obj-$(CONFIG_PERF_EVENTS)	+= perf/
 obj-$(CONFIG_RAS)		+= ras/
 obj-$(CONFIG_THUNDERBOLT)	+= thunderbolt/
-obj-$(CONFIG_CORESIGHT)		+= hwtracing/coresight/
+sobj-$(CONFIG_CORESIGHT)		+= hwtracing/coresight/
 obj-y				+= hwtracing/intel_th/
 obj-$(CONFIG_STM)		+= hwtracing/stm/
 obj-$(CONFIG_ANDROID)		+= android/
 obj-$(CONFIG_NVMEM)		+= nvmem/
 obj-$(CONFIG_FPGA)		+= fpga/
+obj-$(CONFIG_ESOC)		+= esoc/
+obj-$(CONFIG_BIF)		+= bif/
+obj-$(CONFIG_SENSORS_SSC)	+= sensors/
+
+# <t-base drivers
+obj-$(CONFIG_MOBICORE_DRIVER)	+= gud/
+
+# HTC Drivers
+obj-$(CONFIG_HTC_LOGLEVEL)      += htc_loglevel/
