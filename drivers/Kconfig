@@ -198,6 +198,8 @@ source "drivers/hwtracing/intel_th/Kconfig"
 
 source "drivers/fpga/Kconfig"
 
+source "drivers/htc_msm_serial/Kconfig"
+
 source "drivers/htc_loglevel/Kconfig"
 
 endmenu
