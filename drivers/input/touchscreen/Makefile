@@ -91,3 +91,14 @@ obj-$(CONFIG_TOUCHSCREEN_TPS6507X)	+= tps6507x-ts.o
 obj-$(CONFIG_TOUCHSCREEN_ZFORCE)	+= zforce_ts.o
 obj-$(CONFIG_TOUCHSCREEN_COLIBRI_VF50)	+= colibri-vf50-ts.o
 obj-$(CONFIG_TOUCHSCREEN_ROHM_BU21023)	+= rohm_bu21023.o
+obj-$(CONFIG_TOUCHSCREEN_SYNAPTICS_I2C_RMI4)		+= synaptics_i2c_rmi4.o
+obj-$(CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_RMI4_DEV)	+= synaptics_rmi_dev.o
+obj-$(CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE) 	+= synaptics_fw_update.o
+obj-$(CONFIG_TOUCHSCREEN_GT9XX)		+= gt9xx/
+
+# HTC additions
+obj-$(CONFIG_TOUCHSCREEN_CAPSENSOR_FW_UPDATE) += capsensor_fw_update.o
+obj-$(CONFIG_TOUCHSCREEN_CYPRESS_CAP)	+= cypress_cap.o
+obj-$(CONFIG_TOUCHSCREEN_MAX1187X)	+= max1187x.o
+obj-$(CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_HTC) += synaptics_dsx_htc/
+obj-$(CONFIG_TOUCHSCREEN_TOUCH_FW_UPDATE) += touch_fw_update.o
