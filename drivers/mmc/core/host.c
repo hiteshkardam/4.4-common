@@ -35,6 +35,8 @@
 static DEFINE_IDR(mmc_host_idr);
 static DEFINE_SPINLOCK(mmc_host_lock);
 
+extern struct workqueue_struct *stats_workqueue;
+
 static void mmc_host_classdev_release(struct device *dev)
 {
 	struct mmc_host *host = cls_dev_to_mmc_host(dev);
@@ -346,6 +348,10 @@ struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
 	spin_lock_init(&host->lock);
 	init_waitqueue_head(&host->wq);
 	INIT_DELAYED_WORK(&host->detect, mmc_rescan);
+	INIT_DELAYED_WORK(&host->stats_work, mmc_stats);
+
+	host->perf.cmdq_read_map = 0;
+	host->perf.cmdq_write_map = 0;
 #ifdef CONFIG_PM
 	host->pm_notify.notifier_call = mmc_pm_notify;
 #endif
@@ -366,6 +372,215 @@ struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
 }
 
 EXPORT_SYMBOL(mmc_alloc_host);
+
+static ssize_t show_enable(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mmc_host *host = cls_dev_to_mmc_host(dev);
+
+	if (!host)
+		return -EINVAL;
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", mmc_can_scale_clk(host));
+}
+
+static ssize_t store_enable(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mmc_host *host = cls_dev_to_mmc_host(dev);
+	unsigned long value;
+
+	if (!host || !host->card || kstrtoul(buf, 0, &value))
+		return -EINVAL;
+
+	mmc_get_card(host->card);
+
+	if (!value) {
+		/*turning off clock scaling*/
+		mmc_exit_clk_scaling(host);
+		host->caps2 &= ~MMC_CAP2_CLK_SCALE;
+		host->clk_scaling.state = MMC_LOAD_HIGH;
+		/* Set to max. frequency when disabling */
+		mmc_clk_update_freq(host, host->card->clk_scaling_highest,
+					host->clk_scaling.state);
+	} else if (value) {
+		/* starting clock scaling, will restart in case started */
+		host->caps2 |= MMC_CAP2_CLK_SCALE;
+		if (host->clk_scaling.enable)
+			mmc_exit_clk_scaling(host);
+		mmc_init_clk_scaling(host);
+	}
+
+	mmc_put_card(host->card);
+
+	return count;
+}
+
+static ssize_t show_up_threshold(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mmc_host *host = cls_dev_to_mmc_host(dev);
+
+	if (!host)
+		return -EINVAL;
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", host->clk_scaling.upthreshold);
+}
+
+#define MAX_PERCENTAGE	100
+static ssize_t store_up_threshold(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mmc_host *host = cls_dev_to_mmc_host(dev);
+	unsigned long value;
+
+	if (!host || kstrtoul(buf, 0, &value) || (value > MAX_PERCENTAGE))
+		return -EINVAL;
+
+	host->clk_scaling.upthreshold = value;
+
+	pr_debug("%s: clkscale_up_thresh set to %lu\n",
+			mmc_hostname(host), value);
+	return count;
+}
+
+static ssize_t show_down_threshold(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mmc_host *host = cls_dev_to_mmc_host(dev);
+
+	if (!host)
+		return -EINVAL;
+
+	return snprintf(buf, PAGE_SIZE, "%d\n",
+			host->clk_scaling.downthreshold);
+}
+
+static ssize_t store_down_threshold(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mmc_host *host = cls_dev_to_mmc_host(dev);
+	unsigned long value;
+
+	if (!host || kstrtoul(buf, 0, &value) || (value > MAX_PERCENTAGE))
+		return -EINVAL;
+
+	host->clk_scaling.downthreshold = value;
+
+	pr_debug("%s: clkscale_down_thresh set to %lu\n",
+			mmc_hostname(host), value);
+	return count;
+}
+
+static ssize_t show_polling(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mmc_host *host = cls_dev_to_mmc_host(dev);
+
+	if (!host)
+		return -EINVAL;
+
+	return snprintf(buf, PAGE_SIZE, "%lu milliseconds\n",
+			host->clk_scaling.polling_delay_ms);
+}
+
+static ssize_t store_polling(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mmc_host *host = cls_dev_to_mmc_host(dev);
+	unsigned long value;
+
+	if (!host || kstrtoul(buf, 0, &value))
+		return -EINVAL;
+
+	host->clk_scaling.polling_delay_ms = value;
+
+	pr_debug("%s: clkscale_polling_delay_ms set to %lu\n",
+			mmc_hostname(host), value);
+	return count;
+}
+
+DEVICE_ATTR(enable, S_IRUGO | S_IWUSR,
+		show_enable, store_enable);
+DEVICE_ATTR(polling_interval, S_IRUGO | S_IWUSR,
+		show_polling, store_polling);
+DEVICE_ATTR(up_threshold, S_IRUGO | S_IWUSR,
+		show_up_threshold, store_up_threshold);
+DEVICE_ATTR(down_threshold, S_IRUGO | S_IWUSR,
+		show_down_threshold, store_down_threshold);
+
+static struct attribute *clk_scaling_attrs[] = {
+	&dev_attr_enable.attr,
+	&dev_attr_up_threshold.attr,
+	&dev_attr_down_threshold.attr,
+	&dev_attr_polling_interval.attr,
+	NULL,
+};
+
+static struct attribute_group clk_scaling_attr_grp = {
+	.name = "clk_scaling",
+	.attrs = clk_scaling_attrs,
+};
+
+static ssize_t
+show_perf(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mmc_host *host = cls_dev_to_mmc_host(dev);
+	int64_t rtime_drv, wtime_drv;
+	unsigned long rbytes_drv, wbytes_drv, flags;
+
+	spin_lock_irqsave(&host->lock, flags);
+
+	rbytes_drv = host->perf.rbytes_drv;
+	wbytes_drv = host->perf.wbytes_drv;
+
+	rtime_drv = ktime_to_us(host->perf.rtime_drv);
+	wtime_drv = ktime_to_us(host->perf.wtime_drv);
+
+	spin_unlock_irqrestore(&host->lock, flags);
+
+	return snprintf(buf, PAGE_SIZE, "Write performance at driver Level:"
+					"%lu bytes in %lld microseconds\n"
+					"Read performance at driver Level:"
+					"%lu bytes in %lld microseconds\n",
+					wbytes_drv, wtime_drv,
+					rbytes_drv, rtime_drv);
+}
+
+static ssize_t
+set_perf(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct mmc_host *host = cls_dev_to_mmc_host(dev);
+	int64_t value;
+	unsigned long flags;
+
+	sscanf(buf, "%lld", &value);
+	host->debug_mask = value;
+	pr_info("%s: set debug 0x%llx\n", mmc_hostname(host), value);
+	spin_lock_irqsave(&host->lock, flags);
+	if (!value) {
+		memset(&host->perf, 0, sizeof(host->perf));
+		host->perf_enable = false;
+	} else {
+		host->perf_enable = true;
+	}
+	spin_unlock_irqrestore(&host->lock, flags);
+
+	return count;
+}
+
+static DEVICE_ATTR(perf, S_IRUGO | S_IWUSR,
+		show_perf, set_perf);
+
+
+static struct attribute *dev_attrs[] = {
+	&dev_attr_perf.attr,
+	NULL,
+};
+static struct attribute_group dev_attr_grp = {
+	.attrs = dev_attrs,
+};
 
 /**
  *	mmc_add_host - initialise host hardware

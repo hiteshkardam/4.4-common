@@ -298,6 +298,11 @@ int mmc_add_card(struct mmc_card *card)
 	switch (card->type) {
 	case MMC_TYPE_MMC:
 		type = "MMC";
+		if (stats_workqueue && !card->host->perf_enable) {
+			card->host->perf_enable = true;
+			queue_delayed_work(stats_workqueue, &card->host->stats_work,
+				msecs_to_jiffies(MMC_STATS_INTERVAL));
+		}
 		break;
 	case MMC_TYPE_SD:
 		type = "SD";
@@ -306,6 +311,11 @@ int mmc_add_card(struct mmc_card *card)
 				type = "SDXC";
 			else
 				type = "SDHC";
+		}
+		if (stats_workqueue && !card->host->perf_enable) {
+			card->host->perf_enable = true;
+			queue_delayed_work(stats_workqueue, &card->host->stats_work,
+				msecs_to_jiffies(MMC_STATS_INTERVAL));
 		}
 		break;
 	case MMC_TYPE_SDIO:
@@ -378,6 +388,7 @@ void mmc_remove_card(struct mmc_card *card)
 		}
 		device_del(&card->dev);
 		of_node_put(card->dev.of_node);
+		pr_info("%s: %s done\n", mmc_hostname(card->host), __func__);
 	}
 
 	put_device(&card->dev);

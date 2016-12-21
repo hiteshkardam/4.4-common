@@ -29,15 +29,22 @@
 #include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/of.h>
+#include <linux/pm.h>
+#include <linux/jiffies.h>
+#include <linux/statfs.h>
+#include <linux/debugfs.h>
+#include <linux/blkdev.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/mmc.h>
+#include <trace/events/mmcio.h>
 
 #include <linux/mmc/card.h>
 #include <linux/mmc/host.h>
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/sd.h>
 #include <linux/mmc/slot-gpio.h>
+#include <linux/list_sort.h>
 
 #include "core.h"
 #include "bus.h"
@@ -57,13 +64,19 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(mmc_blk_rw_end);
 /* If the device is not responding */
 #define MMC_CORE_TIMEOUT_MS	(10 * 60 * 1000) /* 10 minute timeout */
 
+extern unsigned int get_tamper_sf(void);
+
 /*
  * Background operations can take a long time, depending on the housekeeping
  * operations the card has to perform.
  */
 #define MMC_BKOPS_MAX_TIMEOUT	(4 * 60 * 1000) /* max time to wait in ms */
+#define MMC_DETECT_RETRIES	5
+
+#define MMC_WORKLOAD_DURATION (60 * 60 * 1000) 
 
 static struct workqueue_struct *workqueue;
+struct workqueue_struct *stats_workqueue = NULL;
 static const unsigned freqs[] = { 400000, 300000, 200000, 100000 };
 
 /*
@@ -73,6 +86,362 @@ static const unsigned freqs[] = { 400000, 300000, 200000, 100000 };
  */
 bool use_spi_crc = 1;
 module_param(use_spi_crc, bool, 0);
+
+#define IOTOP_INTERVAL			4500
+#define IOREAD_DUMP_THRESHOLD		10485760 
+#define IOWRITE_DUMP_THRESHOLD		1048576  
+#define IOREAD_DUMP_TOTAL_THRESHOLD	10485760 
+#define IOWRITE_DUMP_TOTAL_THRESHOLD	10485760 
+struct io_account {
+	char task_name[TASK_COMM_LEN];
+	char gtask_name[TASK_COMM_LEN]; 
+	char ptask_name[TASK_COMM_LEN]; 
+	unsigned int pid;
+	unsigned int tgid;
+	unsigned int ppid;
+	u64 io_amount;
+	struct list_head list;
+};
+static LIST_HEAD(ioread_list);
+static LIST_HEAD(iowrite_list);
+static spinlock_t iolist_lock;
+static unsigned long jiffies_next_iotop = 0;
+static int iotop_cmp(void *priv, struct list_head *a, struct list_head *b)
+{
+	struct io_account *ioa = container_of(a, struct io_account, list);
+	struct io_account *iob = container_of(b, struct io_account, list);
+
+	return !(ioa->io_amount > iob->io_amount);
+}
+
+void collect_io_stats(size_t rw_bytes, int type)
+{
+	struct task_struct *process = current;
+	struct io_account *io_act, *tmp;
+	int found;
+	struct list_head *io_list;
+	unsigned long flags;
+
+	if (get_tamper_sf() == 1)
+		return;
+
+	if (!rw_bytes)
+		return;
+
+	if (!strcmp(current->comm, "sdcard"))
+		return;
+
+	if (type == READ)
+		io_list = &ioread_list;
+	else if (type == WRITE)
+		io_list = &iowrite_list;
+	else
+		return;
+
+	found = 0;
+	spin_lock_irqsave(&iolist_lock, flags);
+	list_for_each_entry_safe(io_act, tmp, io_list, list) {
+		if ((process->pid == io_act->pid) && !strcmp(process->comm, io_act->task_name)) {
+			io_act->io_amount += rw_bytes;
+			found = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&iolist_lock, flags);
+
+	if (!found) {
+		io_act = kmalloc(sizeof(struct io_account), GFP_ATOMIC);
+		if (io_act) {
+			snprintf(io_act->task_name, sizeof(io_act->task_name), "%s", process->comm);
+			io_act->pid = process->pid;
+			io_act->tgid = process->tgid;
+			if (process->group_leader)
+				snprintf(io_act->gtask_name, sizeof(io_act->gtask_name), "%s",
+					process->group_leader->comm);
+			if (process->parent) {
+				snprintf(io_act->ptask_name, sizeof(io_act->ptask_name), "%s",
+					process->parent->comm);
+				io_act->ppid = process->parent->pid;
+			}
+			io_act->io_amount = rw_bytes;
+			spin_lock_irqsave(&iolist_lock, flags);
+			list_add(&io_act->list, io_list);
+			spin_unlock_irqrestore(&iolist_lock, flags);
+		}
+	}
+}
+
+static void show_iotop(void)
+{
+	struct io_account *io_act, *tmp;
+	int i = 0;
+	unsigned int task_cnt = 0;
+	unsigned long long total_bytes;
+	unsigned long flags;
+
+	if (get_tamper_sf() == 1)
+		return;
+
+	spin_lock_irqsave(&iolist_lock, flags);
+	list_sort(NULL, &ioread_list, iotop_cmp);
+	total_bytes = 0;
+	list_for_each_entry_safe(io_act, tmp, &ioread_list, list) {
+		list_del_init(&io_act->list);
+		if (i++ < 5 && io_act->io_amount > IOREAD_DUMP_THRESHOLD)
+			pr_info("[READ IOTOP%d] %s(pid %u, tgid %u(%s), ppid %u(%s)): %llu KB\n",
+				i, io_act->task_name, io_act->pid, io_act->tgid, io_act->gtask_name,
+				io_act->ppid, io_act->ptask_name, io_act->io_amount / 1024);
+		task_cnt++;
+		total_bytes += io_act->io_amount;
+		kfree(io_act);
+	}
+	if (total_bytes > IOREAD_DUMP_TOTAL_THRESHOLD)
+		pr_info("[IOTOP] READ total %u tasks, %llu KB\n", task_cnt, total_bytes / 1024);
+
+	list_sort(NULL, &iowrite_list, iotop_cmp);
+	i = 0;
+	total_bytes = 0;
+	task_cnt = 0;
+	list_for_each_entry_safe(io_act, tmp, &iowrite_list, list) {
+		list_del_init(&io_act->list);
+		if (i++ < 5 && io_act->io_amount >= IOWRITE_DUMP_THRESHOLD)
+			pr_info("[WRITE IOTOP%d] %s(pid %u, tgid %u(%s), ppid %u(%s)): %llu KB\n",
+				i, io_act->task_name, io_act->pid, io_act->tgid, io_act->gtask_name,
+				io_act->ppid, io_act->ptask_name, io_act->io_amount / 1024);
+		task_cnt++;
+		total_bytes += io_act->io_amount;
+		kfree(io_act);
+	}
+	spin_unlock_irqrestore(&iolist_lock, flags);
+	if (total_bytes > IOWRITE_DUMP_TOTAL_THRESHOLD)
+		pr_info("[IOTOP] WRITE total %u tasks, %llu KB\n", task_cnt, total_bytes / 1024);
+}
+
+static int stats_interval = MMC_STATS_INTERVAL;
+#define K(x) ((x) << (PAGE_SHIFT - 10))
+void mmc_stats(struct work_struct *work)
+{
+	struct mmc_host *host =
+		container_of(work, struct mmc_host, stats_work.work);
+	unsigned long rtime, wtime;
+	unsigned long rbytes, wbytes, rcnt, wcnt;
+	unsigned long wperf = 0, rperf = 0;
+	unsigned long flags;
+	u64 val;
+	struct kstatfs stat;
+	unsigned long free = 0;
+	int reset_low_perf_data = 1;
+	
+	unsigned long rtime_rand = 0, wtime_rand = 0;
+	unsigned long rbytes_rand = 0, wbytes_rand = 0;
+	unsigned long rcnt_rand = 0, wcnt_rand = 0;
+	unsigned long wperf_rand = 0, rperf_rand = 0;
+	
+	unsigned long erase_time; 
+	unsigned long erase_blks;
+	unsigned long erase_rq;
+	
+	ktime_t workload_diff;
+	unsigned long workload_time; 
+
+	if (!host || !host->perf_enable || !stats_workqueue)
+		return;
+
+	spin_lock_irqsave(&host->lock, flags);
+
+	rbytes = host->perf.rbytes_drv;
+	wbytes = host->perf.wbytes_drv;
+	rcnt = host->perf.rcount;
+	wcnt = host->perf.wcount;
+	rtime = (unsigned long)ktime_to_us(host->perf.rtime_drv);
+	wtime = (unsigned long)ktime_to_us(host->perf.wtime_drv);
+
+	host->perf.rbytes_drv = host->perf.wbytes_drv = 0;
+	host->perf.rcount = host->perf.wcount = 0;
+	host->perf.rtime_drv = ktime_set(0, 0);
+	host->perf.wtime_drv = ktime_set(0, 0);
+
+	
+	erase_time = (unsigned long)ktime_to_ms(host->perf.erase_time);
+	erase_blks = host->perf.erase_blks;
+	erase_rq = host->perf.erase_rq;
+	host->perf.erase_blks = 0;
+	host->perf.erase_rq = 0;
+	host->perf.erase_time = ktime_set(0, 0);
+
+	
+	if (host->debug_mask & MMC_DEBUG_RANDOM_RW) {
+		rbytes_rand = host->perf.rbytes_drv_rand;
+		wbytes_rand = host->perf.wbytes_drv_rand;
+		rcnt_rand = host->perf.rcount_rand;
+		wcnt_rand = host->perf.wcount_rand;
+		rtime_rand = (unsigned long)ktime_to_us(host->perf.rtime_drv_rand);
+		wtime_rand = (unsigned long)ktime_to_us(host->perf.wtime_drv_rand);
+
+		host->perf.rbytes_drv_rand = host->perf.wbytes_drv_rand = 0;
+		host->perf.rcount_rand = host->perf.wcount_rand = 0;
+		host->perf.rtime_drv_rand = ktime_set(0, 0);
+		host->perf.wtime_drv_rand = ktime_set(0, 0);
+	}
+	
+
+	spin_unlock_irqrestore(&host->lock, flags);
+
+	if (wtime) {
+		val = ((u64)wbytes / 1024) * 1000000;
+		do_div(val, wtime);
+		wperf = (unsigned long)val;
+	}
+	if (rtime) {
+		val = ((u64)rbytes / 1024) * 1000000;
+		do_div(val, rtime);
+		rperf = (unsigned long)val;
+	}
+
+	if (host->debug_mask & MMC_DEBUG_FREE_SPACE) {
+		struct file *file;
+		file = filp_open("/data", O_RDONLY, 0);
+		if (!IS_ERR(file)) {
+			vfs_statfs(&file->f_path, &stat);
+			filp_close(file, NULL);
+			free = (unsigned long)stat.f_bfree;
+			free /= 256; 
+		}
+	}
+
+	
+	wtime /= 1000;
+	rtime /= 1000;
+
+	
+	if (!wtime)
+		reset_low_perf_data = 0;
+	else if (wperf < 100) {
+		host->perf.lp_duration += stats_interval; 
+		host->perf.wbytes_low_perf += wbytes;
+		host->perf.wtime_low_perf += wtime; 
+		if (host->perf.lp_duration >= 600000) {
+			unsigned long perf;
+			val = ((u64)host->perf.wbytes_low_perf / 1024) * 1000;
+			do_div(val, host->perf.wtime_low_perf);
+			perf = (unsigned long)val;
+			pr_err("%s Statistics: write %lu KB in %lu ms, perf %lu KB/s, duration %lu sec\n",
+				mmc_hostname(host), host->perf.wbytes_low_perf / 1024,
+				host->perf.wtime_low_perf,
+				perf, host->perf.lp_duration / 1000);
+		} else
+			reset_low_perf_data = 0;
+	}
+	if (host->perf.lp_duration && reset_low_perf_data) {
+		host->perf.lp_duration = 0;
+		host->perf.wbytes_low_perf = 0;
+		host->perf.wtime_low_perf = 0;
+	}
+
+	
+	if ((wtime > 500) || (wtime && (stats_interval == MMC_STATS_LOG_INTERVAL))) {
+		#if 0
+		pr_info("%s Statistics: dirty %luKB, writeback %luKB\n",
+			mmc_hostname(host),
+			K(global_page_state(NR_FILE_DIRTY)),
+			K(global_page_state(NR_WRITEBACK)));
+		#endif
+		if (host->debug_mask & MMC_DEBUG_FREE_SPACE)
+			pr_info("%s Statistics: write %lu KB in %lu ms, perf %lu KB/s, rq %lu, /data free %lu MB\n",
+				mmc_hostname(host), wbytes / 1024, wtime, wperf, wcnt, free);
+		else
+			pr_info("%s Statistics: write %lu KB in %lu ms, perf %lu KB/s, rq %lu\n",
+				mmc_hostname(host), wbytes / 1024, wtime, wperf, wcnt);
+
+		if (rtime) {
+			if (host->debug_mask & MMC_DEBUG_FREE_SPACE)
+				pr_info("%s Statistics: read %lu KB in %lu ms, perf %lu KB/s, rq %lu, /data free %lu MB\n",
+					mmc_hostname(host), rbytes / 1024, rtime, rperf, rcnt, free);
+			else
+				pr_info("%s Statistics: read %lu KB in %lu ms, perf %lu KB/s, rq %lu\n",
+					mmc_hostname(host), rbytes / 1024, rtime, rperf, rcnt);
+		}
+	}
+	else if ((rtime > 500) || (rtime && (stats_interval == MMC_STATS_LOG_INTERVAL))) {
+		if (host->debug_mask & MMC_DEBUG_FREE_SPACE)
+			pr_info("%s Statistics: read %lu KB in %lu ms, perf %lu KB/s, rq %lu, /data free %lu MB\n",
+				mmc_hostname(host), rbytes / 1024, rtime, rperf, rcnt, free);
+		else
+			pr_info("%s Statistics: read %lu KB in %lu ms, perf %lu KB/s, rq %lu\n",
+				mmc_hostname(host), rbytes / 1024, rtime, rperf, rcnt);
+	}
+
+	
+	workload_diff = ktime_sub(ktime_get(), host->perf.workload_time);
+	workload_time = (unsigned long)ktime_to_ms(workload_diff);
+	if (workload_time >= MMC_WORKLOAD_DURATION) {
+		pr_info("%s Statistics: workload write %lu KB (%lu MB)\n",
+			mmc_hostname(host),
+			host->perf.wkbytes_drv, host->perf.wkbytes_drv / 1024);
+		host->perf.wkbytes_drv = 0;
+		host->perf.workload_time = ktime_get();
+	}
+
+	
+	if (erase_time > 500)
+		pr_info("%s Statistics: erase %lu blocks in %lu ms, rq %lu\n",
+			mmc_hostname(host), erase_blks, erase_time, erase_rq);
+
+	if (!jiffies_next_iotop || time_after(jiffies, jiffies_next_iotop)) {
+		jiffies_next_iotop = jiffies + msecs_to_jiffies(IOTOP_INTERVAL);
+		show_iotop();
+	}
+
+	
+	if (host->debug_mask & MMC_DEBUG_RANDOM_RW) {
+		if (wtime_rand) {
+			val = ((u64)wbytes_rand / 1024) * 1000000;
+			do_div(val, wtime_rand);
+			wperf_rand = (unsigned long)val;
+		}
+		if (rtime_rand) {
+			val = ((u64)rbytes_rand / 1024) * 1000000;
+			do_div(val, rtime_rand);
+			rperf_rand = (unsigned long)val;
+		}
+		wtime_rand /= 1000;
+		rtime_rand /= 1000;
+		if (wperf_rand && wtime_rand) {
+			if (host->debug_mask & MMC_DEBUG_FREE_SPACE)
+				pr_info("%s Statistics: random write %lu KB in %lu ms, perf %lu KB/s, rq %lu, /data free %lu MB\n",
+					mmc_hostname(host), wbytes_rand / 1024, wtime_rand, wperf_rand, wcnt_rand, free);
+			else
+				pr_info("%s Statistics: random write %lu KB in %lu ms, perf %lu KB/s, rq %lu\n",
+					mmc_hostname(host), wbytes_rand / 1024, wtime_rand, wperf_rand, wcnt_rand);
+		}
+		if (rperf_rand && rtime_rand) {
+			if (host->debug_mask & MMC_DEBUG_FREE_SPACE)
+				pr_info("%s Statistics: random read %lu KB in %lu ms, perf %lu KB/s, rq %lu, /data free %lu MB\n",
+					mmc_hostname(host), rbytes_rand / 1024, rtime_rand, rperf_rand, rcnt_rand, free);
+			else
+				pr_info("%s Statistics: random read %lu KB in %lu ms, perf %lu KB/s, rq %lu\n",
+					mmc_hostname(host), rbytes_rand / 1024, rtime_rand, rperf_rand, rcnt_rand);
+		}
+	}
+	
+
+	if (host->debug_mask & MMC_DEBUG_MEMORY) {
+		struct sysinfo mi;
+		long cached;
+		si_meminfo(&mi);
+		cached = global_page_state(NR_FILE_PAGES) -
+			total_swapcache_pages();
+		pr_info("meminfo: total %lu KB, free %lu KB, buffers %lu KB, cached %lu KB \n",
+			K(mi.totalram),
+			K(mi.freeram),
+			K(mi.bufferram),
+			K(cached));
+	}
+
+	queue_delayed_work(stats_workqueue, &host->stats_work,
+		msecs_to_jiffies(stats_interval));
+	return;
+}
 
 /*
  * Internal function. Schedule delayed work in the MMC work queue.
@@ -117,7 +486,746 @@ static void mmc_should_fail_request(struct mmc_host *host,
 
 	data->error = data_errors[prandom_u32() % ARRAY_SIZE(data_errors)];
 	data->bytes_xfered = (prandom_u32() % (data->bytes_xfered >> 9)) << 9;
+	data->fault_injected = true;
 }
+
+#else /* CONFIG_FAIL_MMC_REQUEST */
+
+static inline void mmc_should_fail_request(struct mmc_host *host,
+					   struct mmc_request *mrq)
+{
+}
+
+#endif /* CONFIG_FAIL_MMC_REQUEST */
+
+static bool mmc_is_data_request(struct mmc_request *mmc_request)
+{
+	switch (mmc_request->cmd->opcode) {
+	case MMC_READ_SINGLE_BLOCK:
+	case MMC_READ_MULTIPLE_BLOCK:
+	case MMC_WRITE_BLOCK:
+	case MMC_WRITE_MULTIPLE_BLOCK:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void mmc_clk_scaling_start_busy(struct mmc_host *host, bool lock_needed)
+{
+	struct mmc_devfeq_clk_scaling *clk_scaling = &host->clk_scaling;
+
+	if (!clk_scaling->enable)
+		return;
+
+	if (lock_needed)
+		spin_lock_bh(&clk_scaling->lock);
+
+	clk_scaling->start_busy = ktime_get();
+	clk_scaling->is_busy_started = true;
+
+	if (lock_needed)
+		spin_unlock_bh(&clk_scaling->lock);
+}
+
+static void mmc_clk_scaling_stop_busy(struct mmc_host *host, bool lock_needed)
+{
+	struct mmc_devfeq_clk_scaling *clk_scaling = &host->clk_scaling;
+
+	if (!clk_scaling->enable)
+		return;
+
+	if (lock_needed)
+		spin_lock_bh(&clk_scaling->lock);
+
+	if (!clk_scaling->is_busy_started) {
+		WARN_ON(1);
+		goto out;
+	}
+
+	clk_scaling->total_busy_time_us +=
+		ktime_to_us(ktime_sub(ktime_get(),
+			clk_scaling->start_busy));
+	pr_debug("%s: accumulated busy time is %lu usec\n",
+		mmc_hostname(host), clk_scaling->total_busy_time_us);
+	clk_scaling->is_busy_started = false;
+
+out:
+	if (lock_needed)
+		spin_unlock_bh(&clk_scaling->lock);
+}
+
+/**
+ * mmc_cmdq_clk_scaling_start_busy() - start busy timer for data requests
+ * @host: pointer to mmc host structure
+ * @lock_needed: flag indication if locking is needed
+ *
+ * This function starts the busy timer in case it was not already started.
+ */
+void mmc_cmdq_clk_scaling_start_busy(struct mmc_host *host,
+	bool lock_needed)
+{
+	if (!host->clk_scaling.enable)
+		return;
+
+	if (lock_needed)
+		spin_lock_bh(&host->clk_scaling.lock);
+
+	if (!host->clk_scaling.is_busy_started &&
+		!test_bit(CMDQ_STATE_DCMD_ACTIVE,
+			&host->cmdq_ctx.curr_state)) {
+		host->clk_scaling.start_busy = ktime_get();
+		host->clk_scaling.is_busy_started = true;
+	}
+
+	if (lock_needed)
+		spin_unlock_bh(&host->clk_scaling.lock);
+}
+EXPORT_SYMBOL(mmc_cmdq_clk_scaling_start_busy);
+
+/**
+ * mmc_cmdq_clk_scaling_stop_busy() - stop busy timer for last data requests
+ * @host: pointer to mmc host structure
+ * @lock_needed: flag indication if locking is needed
+ *
+ * This function stops the busy timer in case it is the last data request.
+ * In case the current request is not the last one, the busy time till
+ * now will be accumulated and the counter will be restarted.
+ */
+void mmc_cmdq_clk_scaling_stop_busy(struct mmc_host *host,
+	bool lock_needed, bool is_cmdq_dcmd)
+{
+	if (!host->clk_scaling.enable)
+		return;
+
+	if (lock_needed)
+		spin_lock_bh(&host->clk_scaling.lock);
+
+	/*
+	 *  For CQ mode: In completion of DCMD request, start busy time in
+	 *  case of pending data requests
+	 */
+	if (is_cmdq_dcmd) {
+		if (host->cmdq_ctx.data_active_reqs) {
+			host->clk_scaling.is_busy_started = true;
+			host->clk_scaling.start_busy = ktime_get();
+		}
+		goto out;
+	}
+
+	host->clk_scaling.total_busy_time_us +=
+		ktime_to_us(ktime_sub(ktime_get(),
+			host->clk_scaling.start_busy));
+
+	if (host->cmdq_ctx.data_active_reqs) {
+		host->clk_scaling.is_busy_started = true;
+		host->clk_scaling.start_busy = ktime_get();
+	} else {
+		host->clk_scaling.is_busy_started = false;
+	}
+out:
+	if (lock_needed)
+		spin_unlock_bh(&host->clk_scaling.lock);
+
+}
+EXPORT_SYMBOL(mmc_cmdq_clk_scaling_stop_busy);
+
+/**
+ * mmc_can_scale_clk() - Check clock scaling capability
+ * @host: pointer to mmc host structure
+ */
+bool mmc_can_scale_clk(struct mmc_host *host)
+{
+	if (!host) {
+		pr_err("bad host parameter\n");
+		WARN_ON(1);
+		return false;
+	}
+
+	return host->caps2 & MMC_CAP2_CLK_SCALE;
+}
+EXPORT_SYMBOL(mmc_can_scale_clk);
+
+static int mmc_devfreq_get_dev_status(struct device *dev,
+		struct devfreq_dev_status *status)
+{
+	struct mmc_host *host = container_of(dev, struct mmc_host, class_dev);
+	struct mmc_devfeq_clk_scaling *clk_scaling;
+
+	if (!host) {
+		pr_err("bad host parameter\n");
+		WARN_ON(1);
+		return -EINVAL;
+	}
+
+	clk_scaling = &host->clk_scaling;
+
+	if (!clk_scaling->enable)
+		return 0;
+
+	spin_lock_bh(&clk_scaling->lock);
+
+	/* accumulate the busy time of ongoing work */
+	memset(status, 0, sizeof(*status));
+	if (clk_scaling->is_busy_started) {
+		if (mmc_card_cmdq(host->card)) {
+			/* the "busy-timer" will be restarted in case there
+			 * are pending data requests */
+			mmc_cmdq_clk_scaling_stop_busy(host, false, false);
+		} else {
+			mmc_clk_scaling_stop_busy(host, false);
+			mmc_clk_scaling_start_busy(host, false);
+		}
+	}
+
+	status->busy_time = clk_scaling->total_busy_time_us;
+	status->total_time = ktime_to_us(ktime_sub(ktime_get(),
+		clk_scaling->measure_interval_start));
+	clk_scaling->total_busy_time_us = 0;
+	status->current_frequency = clk_scaling->curr_freq;
+	clk_scaling->measure_interval_start = ktime_get();
+
+	pr_debug("%s: status: load = %lu%% - total_time=%lu busy_time = %lu, clk=%lu\n",
+		mmc_hostname(host),
+		(status->busy_time*100)/status->total_time,
+		status->total_time, status->busy_time,
+		status->current_frequency);
+
+	spin_unlock_bh(&clk_scaling->lock);
+
+	return 0;
+}
+
+static bool mmc_is_valid_state_for_clk_scaling(struct mmc_host *host)
+{
+	struct mmc_card *card = host->card;
+	u32 status;
+
+	/*
+	 * If the current partition type is RPMB, clock switching may not
+	 * work properly as sending tuning command (CMD21) is illegal in
+	 * this mode.
+	 */
+	if (!card || (mmc_card_mmc(card) &&
+			(card->part_curr == EXT_CSD_PART_CONFIG_ACC_RPMB ||
+			mmc_card_doing_bkops(card))))
+		return false;
+
+	if (mmc_send_status(card, &status)) {
+		pr_err("%s: Get card status fail\n", mmc_hostname(card->host));
+		return false;
+	}
+
+	return R1_CURRENT_STATE(status) == R1_STATE_TRAN;
+}
+
+int mmc_cmdq_halt_on_empty_queue(struct mmc_host *host)
+{
+	int err = 0;
+
+	err = wait_event_interruptible(host->cmdq_ctx.queue_empty_wq,
+				(!host->cmdq_ctx.active_reqs));
+	if (host->cmdq_ctx.active_reqs) {
+		pr_err("%s: %s: unexpected active requests (%lu)\n",
+			mmc_hostname(host), __func__,
+			host->cmdq_ctx.active_reqs);
+		return -EPERM;
+	}
+
+	err = mmc_cmdq_halt(host, true);
+	if (err) {
+		pr_err("%s: %s: mmc_cmdq_halt failed (%d)\n",
+		       mmc_hostname(host), __func__, err);
+		goto out;
+	}
+
+out:
+	return err;
+}
+EXPORT_SYMBOL(mmc_cmdq_halt_on_empty_queue);
+
+int mmc_clk_update_freq(struct mmc_host *host,
+		unsigned long freq, enum mmc_load state)
+{
+	int err = 0;
+	bool cmdq_mode;
+
+	if (!host) {
+		pr_err("bad host parameter\n");
+		WARN_ON(1);
+		return -EINVAL;
+	}
+
+	mmc_host_clk_hold(host);
+	cmdq_mode = mmc_card_cmdq(host->card);
+
+	/* make sure the card supports the frequency we want */
+	if (unlikely(freq > host->card->clk_scaling_highest)) {
+		freq = host->card->clk_scaling_highest;
+		pr_warn("%s: %s: frequency was overridden to %lu\n",
+				mmc_hostname(host), __func__,
+				host->card->clk_scaling_highest);
+	}
+
+	if (unlikely(freq < host->card->clk_scaling_lowest)) {
+		freq = host->card->clk_scaling_lowest;
+		pr_warn("%s: %s: frequency was overridden to %lu\n",
+			mmc_hostname(host), __func__,
+			host->card->clk_scaling_lowest);
+	}
+
+	if (freq == host->clk_scaling.curr_freq)
+		goto out;
+
+	if (host->ops->notify_load) {
+		err = host->ops->notify_load(host, state);
+		if (err) {
+			pr_err("%s: %s: fail on notify_load\n",
+				mmc_hostname(host), __func__);
+			goto out;
+		}
+	}
+
+	if (cmdq_mode) {
+		err = mmc_cmdq_halt_on_empty_queue(host);
+		if (err) {
+			pr_err("%s: %s: failed halting queue (%d)\n",
+				mmc_hostname(host), __func__, err);
+			goto halt_failed;
+		}
+	}
+
+	if (!mmc_is_valid_state_for_clk_scaling(host)) {
+		pr_debug("%s: invalid state for clock scaling - skipping",
+			mmc_hostname(host));
+		goto invalid_state;
+	}
+
+	err = host->bus_ops->change_bus_speed(host, &freq);
+	if (!err)
+		host->clk_scaling.curr_freq = freq;
+	else
+		pr_err("%s: %s: failed (%d) at freq=%lu\n",
+			mmc_hostname(host), __func__, err, freq);
+
+invalid_state:
+	if (cmdq_mode) {
+		if (mmc_cmdq_halt(host, false))
+			pr_err("%s: %s: cmdq unhalt failed\n",
+			mmc_hostname(host), __func__);
+	}
+
+halt_failed:
+	if (err) {
+		/* restore previous state */
+		if (host->ops->notify_load)
+			if (host->ops->notify_load(host,
+				host->clk_scaling.state))
+				pr_err("%s: %s: fail on notify_load restore\n",
+					mmc_hostname(host), __func__);
+	}
+out:
+	mmc_host_clk_release(host);
+	return err;
+}
+EXPORT_SYMBOL(mmc_clk_update_freq);
+
+static int mmc_devfreq_set_target(struct device *dev,
+				unsigned long *freq, u32 devfreq_flags)
+{
+	struct mmc_host *host = container_of(dev, struct mmc_host, class_dev);
+	struct mmc_devfeq_clk_scaling *clk_scaling;
+	int err = 0;
+	int abort;
+
+	if (!(host && freq)) {
+		pr_err("%s: unexpected host/freq parameter\n", __func__);
+		err = -EINVAL;
+		goto out;
+	}
+	clk_scaling = &host->clk_scaling;
+
+	if (!clk_scaling->enable)
+		goto out;
+
+	pr_debug("%s: target freq = %lu (%s)\n", mmc_hostname(host),
+		*freq, current->comm);
+
+	if ((clk_scaling->curr_freq == *freq) ||
+		clk_scaling->skip_clk_scale_freq_update)
+		goto out;
+
+	/* No need to scale the clocks if they are gated */
+	if (!host->ios.clock)
+		goto out;
+
+	spin_lock_bh(&clk_scaling->lock);
+	if (clk_scaling->clk_scaling_in_progress) {
+		pr_debug("%s: clocks scaling is already in-progress by mmc thread\n",
+			mmc_hostname(host));
+		spin_unlock_bh(&clk_scaling->lock);
+		goto out;
+	}
+	clk_scaling->need_freq_change = true;
+	clk_scaling->target_freq = *freq;
+	clk_scaling->state = *freq < clk_scaling->curr_freq ?
+		MMC_LOAD_LOW : MMC_LOAD_HIGH;
+	spin_unlock_bh(&clk_scaling->lock);
+
+	abort = __mmc_claim_host(host, &clk_scaling->devfreq_abort);
+	if (abort)
+		goto out;
+
+	/*
+	 * In case we were able to claim host there is no need to
+	 * defer the frequency change. It will be done now
+	 */
+	clk_scaling->need_freq_change = false;
+
+	mmc_host_clk_hold(host);
+	err = mmc_clk_update_freq(host, *freq, clk_scaling->state);
+	if (err && err != -EAGAIN)
+		pr_err("%s: clock scale to %lu failed with error %d\n",
+			mmc_hostname(host), *freq, err);
+	else
+		pr_debug("%s: clock change to %lu finished successfully (%s)\n",
+			mmc_hostname(host), *freq, current->comm);
+
+
+	mmc_host_clk_release(host);
+	mmc_release_host(host);
+out:
+	return err;
+}
+
+/**
+ * mmc_deferred_scaling() - scale clocks from data path (mmc thread context)
+ * @host: pointer to mmc host structure
+ *
+ * This function does clock scaling in case "need_freq_change" flag was set
+ * by the clock scaling logic.
+ */
+void mmc_deferred_scaling(struct mmc_host *host)
+{
+	unsigned long target_freq;
+	int err;
+
+	if (!host->clk_scaling.enable)
+		return;
+
+	spin_lock_bh(&host->clk_scaling.lock);
+
+	if (host->clk_scaling.clk_scaling_in_progress ||
+		!(host->clk_scaling.need_freq_change)) {
+		spin_unlock_bh(&host->clk_scaling.lock);
+		return;
+	}
+
+
+	atomic_inc(&host->clk_scaling.devfreq_abort);
+	target_freq = host->clk_scaling.target_freq;
+	host->clk_scaling.clk_scaling_in_progress = true;
+	host->clk_scaling.need_freq_change = false;
+	spin_unlock_bh(&host->clk_scaling.lock);
+	pr_debug("%s: doing deferred frequency change (%lu) (%s)\n",
+				mmc_hostname(host),
+				target_freq, current->comm);
+
+	err = mmc_clk_update_freq(host, target_freq,
+		host->clk_scaling.state);
+	if (err && err != -EAGAIN)
+		pr_err("%s: failed on deferred scale clocks (%d)\n",
+			mmc_hostname(host), err);
+	else
+		pr_debug("%s: clocks were successfully scaled to %lu (%s)\n",
+			mmc_hostname(host),
+			target_freq, current->comm);
+	host->clk_scaling.clk_scaling_in_progress = false;
+	atomic_dec(&host->clk_scaling.devfreq_abort);
+}
+EXPORT_SYMBOL(mmc_deferred_scaling);
+
+static int mmc_devfreq_create_freq_table(struct mmc_host *host)
+{
+	int i;
+	struct mmc_devfeq_clk_scaling *clk_scaling = &host->clk_scaling;
+
+	pr_debug("%s: supported: lowest=%lu, highest=%lu\n",
+		mmc_hostname(host),
+		host->card->clk_scaling_lowest,
+		host->card->clk_scaling_highest);
+
+	if (!clk_scaling->freq_table) {
+		pr_debug("%s: no frequency table defined -  setting default\n",
+			mmc_hostname(host));
+		clk_scaling->freq_table = kzalloc(
+			2*sizeof(*(clk_scaling->freq_table)), GFP_KERNEL);
+		if (!clk_scaling->freq_table)
+			return -ENOMEM;
+		clk_scaling->freq_table[0] = host->card->clk_scaling_lowest;
+		clk_scaling->freq_table[1] = host->card->clk_scaling_highest;
+		clk_scaling->freq_table_sz = 2;
+		goto out;
+	}
+
+	if (host->card->clk_scaling_lowest >
+		clk_scaling->freq_table[0])
+		pr_debug("%s: frequency table undershot possible freq\n",
+			mmc_hostname(host));
+
+	for (i = 0; i < clk_scaling->freq_table_sz; i++) {
+		if (clk_scaling->freq_table[i] <=
+			host->card->clk_scaling_highest)
+			continue;
+		clk_scaling->freq_table[i] =
+			host->card->clk_scaling_highest;
+		clk_scaling->freq_table_sz = i + 1;
+		pr_debug("%s: frequency table overshot possible freq (%d)\n",
+				mmc_hostname(host), clk_scaling->freq_table[i]);
+		break;
+	}
+
+out:
+	clk_scaling->devfreq_profile.freq_table = clk_scaling->freq_table;
+	clk_scaling->devfreq_profile.max_state = clk_scaling->freq_table_sz;
+
+	for (i = 0; i < clk_scaling->freq_table_sz; i++)
+		pr_debug("%s: freq[%d] = %u\n",
+			mmc_hostname(host), i, clk_scaling->freq_table[i]);
+
+	return 0;
+}
+
+/**
+ * mmc_init_devfreq_clk_scaling() - Initialize clock scaling
+ * @host: pointer to mmc host structure
+ *
+ * Initialize clock scaling for supported hosts. It is assumed that the caller
+ * ensure clock is running at maximum possible frequency before calling this
+ * function. Shall use struct devfreq_simple_ondemand_data to configure
+ * governor.
+ */
+int mmc_init_clk_scaling(struct mmc_host *host)
+{
+	int err;
+
+	if (!host || !host->card) {
+		pr_err("%s: unexpected host/card parameters\n",
+			__func__);
+		return -EINVAL;
+	}
+
+	if (!mmc_can_scale_clk(host) ||
+		!host->bus_ops->change_bus_speed) {
+		pr_debug("%s: clock scaling is not supported\n",
+			mmc_hostname(host));
+		return 0;
+	}
+
+	pr_debug("registering %s dev (%p) to devfreq",
+		mmc_hostname(host),
+		mmc_classdev(host));
+
+	if (host->clk_scaling.devfreq) {
+		pr_err("%s: dev is already registered for dev %p\n",
+			mmc_hostname(host),
+			mmc_dev(host));
+		return -EPERM;
+	}
+	spin_lock_init(&host->clk_scaling.lock);
+	atomic_set(&host->clk_scaling.devfreq_abort, 0);
+	host->clk_scaling.curr_freq = host->ios.clock;
+	host->clk_scaling.clk_scaling_in_progress = false;
+	host->clk_scaling.need_freq_change = false;
+	host->clk_scaling.is_busy_started = false;
+
+	host->clk_scaling.devfreq_profile.polling_ms =
+		host->clk_scaling.polling_delay_ms;
+	host->clk_scaling.devfreq_profile.get_dev_status =
+		mmc_devfreq_get_dev_status;
+	host->clk_scaling.devfreq_profile.target = mmc_devfreq_set_target;
+	host->clk_scaling.devfreq_profile.initial_freq = host->ios.clock;
+
+	host->clk_scaling.ondemand_gov_data.simple_scaling = true;
+	host->clk_scaling.ondemand_gov_data.upthreshold =
+		host->clk_scaling.upthreshold;
+	host->clk_scaling.ondemand_gov_data.downdifferential =
+		host->clk_scaling.upthreshold - host->clk_scaling.downthreshold;
+
+	err = mmc_devfreq_create_freq_table(host);
+	if (err) {
+		pr_err("%s: fail to create devfreq frequency table\n",
+			mmc_hostname(host));
+		return err;
+	}
+
+	pr_debug("%s: adding devfreq with: upthreshold=%u downthreshold=%u polling=%u\n",
+		mmc_hostname(host),
+		host->clk_scaling.ondemand_gov_data.upthreshold,
+		host->clk_scaling.ondemand_gov_data.downdifferential,
+		host->clk_scaling.devfreq_profile.polling_ms);
+	host->clk_scaling.devfreq = devfreq_add_device(
+		mmc_classdev(host),
+		&host->clk_scaling.devfreq_profile,
+		"simple_ondemand",
+		&host->clk_scaling.ondemand_gov_data);
+	if (!host->clk_scaling.devfreq) {
+		pr_err("%s: unable to register with devfreq\n",
+			mmc_hostname(host));
+		return -EPERM;
+	}
+
+	pr_debug("%s: clk scaling is enabled for device %s (%p) with devfreq %p (clock = %uHz)\n",
+		mmc_hostname(host),
+		dev_name(mmc_classdev(host)),
+		mmc_classdev(host),
+		host->clk_scaling.devfreq,
+		host->ios.clock);
+
+	host->clk_scaling.enable = true;
+
+	return err;
+}
+EXPORT_SYMBOL(mmc_init_clk_scaling);
+
+/**
+ * mmc_suspend_clk_scaling() - suspend clock scaling
+ * @host: pointer to mmc host structure
+ *
+ * This API will suspend devfreq feature for the specific host.
+ * The statistics collected by mmc will be cleared.
+ * This function is intended to be called by the pm callbacks
+ * (e.g. runtime_suspend, suspend) of the mmc device
+ */
+int mmc_suspend_clk_scaling(struct mmc_host *host)
+{
+	int err = 0;
+
+	if (!host) {
+		WARN(1, "bad host parameter\n");
+		return -EINVAL;
+	}
+
+	if (!mmc_can_scale_clk(host) || !host->clk_scaling.enable)
+		return 0;
+
+	if (!host->clk_scaling.devfreq) {
+		pr_err("%s: %s: no devfreq is assosiated with this device\n",
+			mmc_hostname(host), __func__);
+		return -EPERM;
+	}
+
+	atomic_inc(&host->clk_scaling.devfreq_abort);
+	wake_up(&host->wq);
+	err = devfreq_suspend_device(host->clk_scaling.devfreq);
+	if (err) {
+		pr_err("%s: %s: failed to suspend devfreq\n",
+			mmc_hostname(host), __func__);
+		return err;
+	}
+	host->clk_scaling.enable = false;
+
+	host->clk_scaling.total_busy_time_us = 0;
+
+	pr_debug("%s: devfreq suspended\n", mmc_hostname(host));
+
+	return 0;
+}
+EXPORT_SYMBOL(mmc_suspend_clk_scaling);
+
+/**
+ * mmc_resume_clk_scaling() - resume clock scaling
+ * @host: pointer to mmc host structure
+ *
+ * This API will resume devfreq feature for the specific host.
+ * This API is intended to be called by the pm callbacks
+ * (e.g. runtime_suspend, suspend) of the mmc device
+ */
+int mmc_resume_clk_scaling(struct mmc_host *host)
+{
+	int err = 0;
+	u32 max_clk_idx = 0;
+	u32 devfreq_max_clk = 0;
+	u32 devfreq_min_clk = 0;
+
+	if (!host) {
+		WARN(1, "bad host parameter\n");
+		return -EINVAL;
+	}
+
+	if (!mmc_can_scale_clk(host))
+		return 0;
+
+	if (!host->clk_scaling.devfreq) {
+		pr_err("%s: %s: no devfreq is assosiated with this device\n",
+			mmc_hostname(host), __func__);
+		return -EPERM;
+	}
+
+	atomic_set(&host->clk_scaling.devfreq_abort, 0);
+
+	max_clk_idx = host->clk_scaling.freq_table_sz - 1;
+	devfreq_max_clk = host->clk_scaling.freq_table[max_clk_idx];
+	devfreq_min_clk = host->clk_scaling.freq_table[0];
+
+	host->clk_scaling.curr_freq = devfreq_max_clk;
+	if (host->ios.clock < host->card->clk_scaling_highest)
+		host->clk_scaling.curr_freq = devfreq_min_clk;
+
+	host->clk_scaling.clk_scaling_in_progress = false;
+	host->clk_scaling.need_freq_change = false;
+
+	err = devfreq_resume_device(host->clk_scaling.devfreq);
+	if (err) {
+		pr_err("%s: %s: failed to resume devfreq (%d)\n",
+			mmc_hostname(host), __func__, err);
+	} else {
+		host->clk_scaling.enable = true;
+		pr_debug("%s: devfreq resumed\n", mmc_hostname(host));
+	}
+
+	return err;
+}
+EXPORT_SYMBOL(mmc_resume_clk_scaling);
+
+/**
+ * mmc_exit_devfreq_clk_scaling() - Disable clock scaling
+ * @host: pointer to mmc host structure
+ *
+ * Disable clock scaling permanently.
+ */
+int mmc_exit_clk_scaling(struct mmc_host *host)
+{
+	int err;
+
+	if (!host) {
+		pr_err("%s: bad host parameter\n", __func__);
+		WARN_ON(1);
+		return -EINVAL;
+	}
+
+	if (!mmc_can_scale_clk(host))
+		return 0;
+
+	if (!host->clk_scaling.devfreq) {
+		pr_err("%s: %s: no devfreq is assosiated with this device\n",
+			mmc_hostname(host), __func__);
+		return -EPERM;
+	}
+
+	err = mmc_suspend_clk_scaling(host);
+	if (err) {
+		pr_err("%s: %s: fail to suspend clock scaling (%d)\n",
+			mmc_hostname(host), __func__,  err);
+		return err;
+	}
+
+	err = devfreq_remove_device(host->clk_scaling.devfreq);
+	if (err) {
+		pr_err("%s: remove devfreq failed (%d)\n",
+			mmc_hostname(host), err);
+		return err;
+	}
 
 #else /* CONFIG_FAIL_MMC_REQUEST */
 
@@ -140,6 +1248,7 @@ void mmc_request_done(struct mmc_host *host, struct mmc_request *mrq)
 {
 	struct mmc_command *cmd = mrq->cmd;
 	int err = cmd->error;
+	ktime_t diff;
 
 	/* Flag re-tuning needed on CRC errors */
 	if ((cmd->opcode != MMC_SEND_TUNING_BLOCK &&
@@ -180,6 +1289,53 @@ void mmc_request_done(struct mmc_host *host, struct mmc_request *mrq)
 			cmd->resp[2], cmd->resp[3]);
 
 		if (mrq->data) {
+			if (host->perf_enable && cmd->opcode != MMC_SEND_EXT_CSD) {
+				unsigned long flags;
+				diff = ktime_sub(ktime_get(), host->perf.start);
+				if (host->card && mmc_card_mmc(host->card))
+					trace_mmc_request_done(&host->class_dev,
+						cmd->opcode, mrq->cmd->arg,
+						mrq->data->blocks, ktime_to_ms(diff), 0);
+				spin_lock_irqsave(&host->lock, flags);
+				if (mrq->data->flags == MMC_DATA_READ) {
+					host->perf.rbytes_drv +=
+							mrq->data->bytes_xfered;
+					host->perf.rtime_drv =
+						ktime_add(host->perf.rtime_drv,
+							diff);
+					host->perf.rcount++;
+					if (host->debug_mask & MMC_DEBUG_RANDOM_RW) {
+						if (mrq->data->bytes_xfered <= 32*1024) {
+							host->perf.rbytes_drv_rand +=
+								mrq->data->bytes_xfered;
+							host->perf.rtime_drv_rand =
+								ktime_add(host->perf.rtime_drv_rand,
+									diff);
+							host->perf.rcount_rand++;
+						}
+					}
+				} else {
+					host->perf.wbytes_drv +=
+						mrq->data->bytes_xfered;
+					host->perf.wkbytes_drv +=
+						(mrq->data->bytes_xfered / 1024);
+					host->perf.wtime_drv =
+						ktime_add(host->perf.wtime_drv,
+							diff);
+					host->perf.wcount++;
+					if (host->debug_mask & MMC_DEBUG_RANDOM_RW) {
+						if (mrq->data->bytes_xfered <= 32*1024) {
+							host->perf.wbytes_drv_rand +=
+								mrq->data->bytes_xfered;
+							host->perf.wtime_drv_rand =
+								ktime_add(host->perf.wtime_drv_rand,
+									diff);
+							host->perf.wcount_rand++;
+						}
+					}
+				}
+				spin_unlock_irqrestore(&host->lock, flags);
+			}
 			pr_debug("%s:     %d bytes transferred: %d\n",
 				mmc_hostname(host),
 				mrq->data->bytes_xfered, mrq->data->error);
@@ -274,6 +1430,9 @@ static int mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
 			mrq->data->blocks, mrq->data->flags,
 			mrq->data->timeout_ns / 1000000,
 			mrq->data->timeout_clks);
+		if (host->card && mmc_card_mmc(host->card))
+			trace_mmc_req_start(&host->class_dev, mrq->cmd->opcode,
+				mrq->cmd->arg, mrq->data->blocks, 0);
 	}
 
 	if (mrq->stop) {
@@ -283,6 +1442,10 @@ static int mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
 	}
 
 	WARN_ON(!host->claimed);
+
+	if (!host->claimed) {
+		pr_err("%s %s host claim fail\n", mmc_hostname(host), __func__);
+	}
 
 	mrq->cmd->error = 0;
 	mrq->cmd->mrq = mrq;
@@ -314,6 +1477,10 @@ static int mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
 	}
 	led_trigger_event(host->led, LED_FULL);
 	__mmc_start_request(host, mrq);
+		if (host->perf_enable)
+			host->perf.start = ktime_get();
+	}
+	mmc_host_clk_hold(host);
 
 	return 0;
 }
@@ -504,10 +1671,13 @@ static int mmc_wait_for_data_req_done(struct mmc_host *host,
 	return err;
 }
 
+#define MMC_REQUEST_TIMEOUT	10000 
 static void mmc_wait_for_req_done(struct mmc_host *host,
 				  struct mmc_request *mrq)
 {
 	struct mmc_command *cmd;
+	unsigned long timeout;
+	int ret;
 
 	while (1) {
 		wait_for_completion(&mrq->completion);
@@ -1912,6 +3082,8 @@ static void _mmc_detect_change(struct mmc_host *host, unsigned long delay,
 	if (cd_irq && !(host->caps & MMC_CAP_NEEDS_POLL) &&
 		device_can_wakeup(mmc_dev(host)))
 		pm_wakeup_event(mmc_dev(host), 5000);
+	else
+		pm_wakeup_event(mmc_dev(host), 1000);
 
 	host->detect_change = 1;
 	mmc_schedule_delayed_work(&host->detect, delay);
@@ -2082,6 +3254,151 @@ static unsigned int mmc_erase_timeout(struct mmc_card *card,
 		return mmc_mmc_erase_timeout(card, arg, qty);
 }
 
+static u32 mmc_get_erase_qty(struct mmc_card *card, u32 from, u32 to)
+{
+	u32 qty = 0;
+	/*
+	 * qty is used to calculate the erase timeout which depends on how many
+	 * erase groups (or allocation units in SD terminology) are affected.
+	 * We count erasing part of an erase group as one erase group.
+	 * For SD, the allocation units are always a power of 2.  For MMC, the
+	 * erase group size is almost certainly also power of 2, but it does not
+	 * seem to insist on that in the JEDEC standard, so we fall back to
+	 * division in that case.  SD may not specify an allocation unit size,
+	 * in which case the timeout is based on the number of write blocks.
+	 *
+	 * Note that the timeout for secure trim 2 will only be correct if the
+	 * number of erase groups specified is the same as the total of all
+	 * preceding secure trim 1 commands.  Since the power may have been
+	 * lost since the secure trim 1 commands occurred, it is generally
+	 * impossible to calculate the secure trim 2 timeout correctly.
+	 */
+	if (card->erase_shift)
+		qty += ((to >> card->erase_shift) -
+			(from >> card->erase_shift)) + 1;
+	else if (mmc_card_sd(card))
+		qty += to - from + 1;
+	else
+		qty += ((to / card->erase_size) -
+			(from / card->erase_size)) + 1;
+	return qty;
+}
+
+static int mmc_cmdq_send_erase_cmd(struct mmc_cmdq_req *cmdq_req,
+		struct mmc_card *card, u32 opcode, u32 arg, u32 qty)
+{
+	struct mmc_command *cmd = cmdq_req->mrq.cmd;
+	int err;
+
+	memset(cmd, 0, sizeof(struct mmc_command));
+
+	cmd->opcode = opcode;
+	cmd->arg = arg;
+	if (cmd->opcode == MMC_ERASE) {
+		cmd->flags = MMC_RSP_SPI_R1B | MMC_RSP_R1B | MMC_CMD_AC;
+		cmd->busy_timeout = mmc_erase_timeout(card, arg, qty);
+	} else {
+		cmd->flags = MMC_RSP_SPI_R1 | MMC_RSP_R1 | MMC_CMD_AC;
+	}
+
+	err = mmc_cmdq_wait_for_dcmd(card->host, cmdq_req);
+	if (err) {
+		pr_err("mmc_erase: group start error %d, status %#x\n",
+				err, cmd->resp[0]);
+		return -EIO;
+	}
+	return 0;
+}
+
+static int mmc_cmdq_do_erase(struct mmc_cmdq_req *cmdq_req,
+			struct mmc_card *card, unsigned int from,
+			unsigned int to, unsigned int arg)
+{
+	struct mmc_command *cmd = cmdq_req->mrq.cmd;
+	unsigned int qty = 0;
+	unsigned long timeout;
+	unsigned int fr, nr;
+	int err;
+	ktime_t start, diff;
+
+	fr = from;
+	nr = to - from + 1;
+	trace_mmc_blk_erase_start(arg, fr, nr);
+
+	qty = mmc_get_erase_qty(card, from, to);
+
+	if (!mmc_card_blockaddr(card)) {
+		from <<= 9;
+		to <<= 9;
+	}
+
+	/* Must not be less than 1 second */
+	if (erase_timeout < 1000)
+		erase_timeout = 1000;
+
+	return erase_timeout;
+}
+
+static unsigned int mmc_erase_timeout(struct mmc_card *card,
+				      unsigned int arg,
+				      unsigned int qty)
+{
+	if (mmc_card_sd(card))
+		return mmc_sd_erase_timeout(card, arg, qty);
+	else
+		return mmc_mmc_erase_timeout(card, arg, qty);
+	trace_mmc_req_start(&(card->host->class_dev), MMC_ERASE,
+			from, to - from + 1, 0);
+
+	start = ktime_get();
+	err = mmc_cmdq_send_erase_cmd(cmdq_req, card, MMC_ERASE,
+			arg, qty);
+	if (err)
+		goto out;
+
+	timeout = jiffies + msecs_to_jiffies(MMC_CORE_TIMEOUT_MS);
+	do {
+		memset(cmd, 0, sizeof(struct mmc_command));
+		cmd->opcode = MMC_SEND_STATUS;
+		cmd->arg = card->rca << 16;
+		cmd->flags = MMC_RSP_R1 | MMC_CMD_AC;
+		/* Do not retry else we can't see errors */
+		err = mmc_cmdq_wait_for_dcmd(card->host, cmdq_req);
+		if (err || (cmd->resp[0] & 0xFDF92000)) {
+			pr_err("error %d requesting status %#x\n",
+				err, cmd->resp[0]);
+			err = -EIO;
+			goto out;
+		}
+		/* Timeout if the device never becomes ready for data and
+		 * never leaves the program state.
+		 */
+		if (time_after(jiffies, timeout)) {
+			pr_err("%s: Card stuck in programming state! %s\n",
+				mmc_hostname(card->host), __func__);
+			err =  -EIO;
+			goto out;
+		}
+	} while (!(cmd->resp[0] & R1_READY_FOR_DATA) ||
+		 (R1_CURRENT_STATE(cmd->resp[0]) == R1_STATE_PRG));
+
+	diff = ktime_sub(ktime_get(), start);
+	if (ktime_to_ms(diff) >= 3000)
+		pr_info("%s: erase(sector %u to %u) takes %lld ms\n",
+			mmc_hostname(card->host), from, to, ktime_to_ms(diff));
+
+	card->host->perf.erase_blks += (to - from + 1);
+	card->host->perf.erase_time =
+		ktime_add(card->host->perf.erase_time, diff);
+	card->host->perf.erase_rq++;
+
+	trace_mmc_request_done(&(card->host->class_dev), MMC_ERASE,
+			from, to - from + 1, ktime_to_ms(diff), 0);
+out:
+	trace_mmc_blk_erase_end(arg, fr, nr);
+	return err;
+}
+
 static int mmc_do_erase(struct mmc_card *card, unsigned int from,
 			unsigned int to, unsigned int arg)
 {
@@ -2090,6 +3407,7 @@ static int mmc_do_erase(struct mmc_card *card, unsigned int from,
 	unsigned long timeout;
 	unsigned int fr, nr;
 	int err;
+	ktime_t start, diff;
 
 	fr = from;
 	nr = to - from + 1;
@@ -2156,6 +3474,12 @@ static int mmc_do_erase(struct mmc_card *card, unsigned int from,
 		goto out;
 	}
 
+	if (mmc_card_mmc(card)) {
+		trace_mmc_req_start(&(card->host->class_dev), MMC_ERASE,
+			from, to - from + 1, 0);
+	}
+
+	start = ktime_get();
 	memset(&cmd, 0, sizeof(struct mmc_command));
 	cmd.opcode = MMC_ERASE;
 	cmd.arg = arg;
@@ -2199,6 +3523,21 @@ static int mmc_do_erase(struct mmc_card *card, unsigned int from,
 
 	} while (!(cmd.resp[0] & R1_READY_FOR_DATA) ||
 		 (R1_CURRENT_STATE(cmd.resp[0]) == R1_STATE_PRG));
+
+	diff = ktime_sub(ktime_get(), start);
+	if (ktime_to_ms(diff) >= 3000)
+		pr_info("%s: erase(sector %u to %u) takes %lld ms\n",
+			mmc_hostname(card->host), from, to, ktime_to_ms(diff));
+
+	card->host->perf.erase_blks += (to - from + 1);
+	card->host->perf.erase_time =
+		ktime_add(card->host->perf.erase_time, diff);
+	card->host->perf.erase_rq++;
+
+	if (mmc_card_mmc(card)) {
+		trace_mmc_request_done(&(card->host->class_dev), MMC_ERASE,
+			from, to - from + 1, ktime_to_ms(diff), 0);
+	}
 out:
 	mmc_retune_release(card->host);
 	trace_mmc_blk_erase_end(arg, fr, nr);
@@ -2242,6 +3581,18 @@ int mmc_erase(struct mmc_card *card, unsigned int from, unsigned int nr,
 		if (from % card->erase_size || nr % card->erase_size)
 			return -EINVAL;
 	}
+
+int mmc_cmdq_erase(struct mmc_cmdq_req *cmdq_req,
+	      struct mmc_card *card, unsigned int from, unsigned int nr,
+	      unsigned int arg)
+{
+	unsigned int rem, to = from + nr;
+	int ret;
+
+	ret = mmc_erase_sanity_check(card, from, nr, arg);
+	if (ret)
+		return ret;
+		}
 
 	if (arg == MMC_ERASE_ARG) {
 		rem = from % card->erase_size;
@@ -2606,6 +3957,34 @@ void mmc_rescan(struct work_struct *work)
 		container_of(work, struct mmc_host, detect.work);
 	int i;
 
+	pr_info("%s: %s rescan_disable %d nonremovable %d rescan_entered %d\n",
+		mmc_hostname(host), __func__, host->rescan_disable,
+		(host->caps & MMC_CAP_NONREMOVABLE) ? 1 : 0, host->rescan_entered);
+
+	if (host->card && host->card->force_remove) {
+		pr_info("%s: %s remove card (removed_cnt = %d)\n", mmc_hostname(host),
+			__func__, host->removed_cnt);
+		mmc_bus_get(host);
+		if (host->bus_ops && host->bus_ops->remove)
+			host->bus_ops->remove(host);
+		mmc_claim_host(host);
+		mmc_detach_bus(host);
+		mmc_power_off(host);
+		mmc_release_host(host);
+		mmc_bus_put(host);
+		if (host->ops->get_cd && (host->ops->get_cd(host) == 0
+			|| host->removed_cnt > MMC_DETECT_RETRIES)) {
+			pr_info("%s : SD status was (%d), or rescan up to limit (%d)\n",
+				mmc_hostname(host), host->ops->get_cd(host),
+				host->removed_cnt);
+			return;
+		} else if ((host->caps & MMC_CAP_NONREMOVABLE) &&
+			(host->removed_cnt > MMC_DETECT_RETRIES)) {
+			pr_info("%s : rescan up to limit (%d)\n",
+				mmc_hostname(host),	host->removed_cnt);
+			return;
+		}
+	}
 	if (host->trigger_card_event && host->ops->card_event) {
 		host->ops->card_event(host);
 		host->trigger_card_event = false;
@@ -2651,10 +4030,13 @@ void mmc_rescan(struct work_struct *work)
 	mmc_bus_put(host);
 
 	if (!(host->caps & MMC_CAP_NONREMOVABLE) && host->ops->get_cd &&
-			host->ops->get_cd(host) == 0) {
+			(host->ops->get_cd(host) == 0 || host->removed_cnt > MMC_DETECT_RETRIES)) {
 		mmc_claim_host(host);
 		mmc_power_off(host);
 		mmc_release_host(host);
+		pr_info("%s : SD status was (%d), or rescan up to limit2 (%d)\n",
+			mmc_hostname(host), host->ops->get_cd(host),
+			host->removed_cnt);
 		goto out;
 	}
 
@@ -2818,8 +4200,10 @@ int mmc_pm_notify(struct notifier_block *notify_block,
 	case PM_RESTORE_PREPARE:
 		spin_lock_irqsave(&host->lock, flags);
 		host->rescan_disable = 1;
+		host->retry_disable = 1;
 		spin_unlock_irqrestore(&host->lock, flags);
 		cancel_delayed_work_sync(&host->detect);
+		host->retry_disable = 0;
 
 		if (!host->bus_ops)
 			break;
@@ -2853,6 +4237,126 @@ int mmc_pm_notify(struct notifier_block *notify_block,
 	return 0;
 }
 #endif
+
+void mmc_prepare_mrq(struct mmc_card *card,
+	struct mmc_request *mrq, struct scatterlist *sg, unsigned sg_len,
+	unsigned dev_addr, unsigned blocks, unsigned blksz, int write)
+{
+	BUG_ON(!mrq || !mrq->cmd || !mrq->data || !mrq->stop);
+
+	if (blocks > 1) {
+		mrq->cmd->opcode = write ?
+			MMC_WRITE_MULTIPLE_BLOCK : MMC_READ_MULTIPLE_BLOCK;
+	} else {
+		mrq->cmd->opcode = write ?
+			MMC_WRITE_BLOCK : MMC_READ_SINGLE_BLOCK;
+	}
+
+	mrq->cmd->arg = dev_addr;
+	if (!mmc_card_blockaddr(card))
+		mrq->cmd->arg <<= 9;
+
+	mrq->cmd->flags = MMC_RSP_R1 | MMC_CMD_ADTC;
+
+	if (blocks == 1)
+		mrq->stop = NULL;
+	else {
+		mrq->stop->opcode = MMC_STOP_TRANSMISSION;
+		mrq->stop->arg = 0;
+		mrq->stop->flags = MMC_RSP_R1B | MMC_CMD_AC;
+	}
+
+	mrq->data->blksz = blksz;
+	mrq->data->blocks = blocks;
+	mrq->data->flags = write ? MMC_DATA_WRITE : MMC_DATA_READ;
+	mrq->data->sg = sg;
+	mrq->data->sg_len = sg_len;
+
+	mmc_set_data_timeout(mrq->data, card);
+}
+EXPORT_SYMBOL(mmc_prepare_mrq);
+
+static int mmc_busy(struct mmc_command *cmd)
+{
+	return !(cmd->resp[0] & R1_READY_FOR_DATA) ||
+		(R1_CURRENT_STATE(cmd->resp[0]) == R1_STATE_PRG);
+}
+
+int mmc_wait_busy(struct mmc_card *card)
+{
+	int ret, busy = 0;
+	struct mmc_command cmd = {0};
+
+	memset(&cmd, 0, sizeof(struct mmc_command));
+	cmd.opcode = MMC_SEND_STATUS;
+	cmd.arg = card->rca << 16;
+	cmd.flags = MMC_RSP_SPI_R2 | MMC_RSP_R1 | MMC_CMD_AC;
+
+	do {
+		ret = mmc_wait_for_cmd(card->host, &cmd, 0);
+		if (ret)
+			break;
+
+		if (!busy && mmc_busy(&cmd)) {
+			busy = 1;
+			if (card->host->caps & MMC_CAP_WAIT_WHILE_BUSY) {
+				pr_warn("%s: Warning: Host did not "
+					"wait for busy state to end.\n",
+					mmc_hostname(card->host));
+			}
+		}
+
+	} while (mmc_busy(&cmd));
+
+	return ret;
+}
+EXPORT_SYMBOL(mmc_wait_busy);
+
+int mmc_check_result(struct mmc_request *mrq)
+{
+	int ret;
+
+	BUG_ON(!mrq || !mrq->cmd || !mrq->data);
+
+	ret = 0;
+
+	if (!ret && mrq->cmd->error)
+		ret = mrq->cmd->error;
+	if (!ret && mrq->data->error)
+		ret = mrq->data->error;
+	if (!ret && mrq->stop && mrq->stop->error)
+		ret = mrq->stop->error;
+	if (!ret && mrq->data->bytes_xfered !=
+		mrq->data->blocks * mrq->data->blksz)
+		ret = -EPERM;
+
+	return ret;
+}
+EXPORT_SYMBOL(mmc_check_result);
+
+int mmc_simple_transfer(struct mmc_card *card,
+	struct scatterlist *sg, unsigned sg_len, unsigned dev_addr,
+	unsigned blocks, unsigned blksz, int write)
+{
+	struct mmc_request mrq = {0};
+	struct mmc_command cmd = {0};
+	struct mmc_command stop = {0};
+	struct mmc_data data = {0};
+
+	mrq.cmd = &cmd;
+	mrq.data = &data;
+	mrq.stop = &stop;
+
+	mmc_prepare_mrq(card, &mrq, sg, sg_len, dev_addr,
+		blocks, blksz, write);
+
+	mmc_wait_for_req(card->host, &mrq);
+
+	mmc_wait_busy(card);
+
+	return mmc_check_result(&mrq);
+}
+EXPORT_SYMBOL(mmc_simple_transfer);
 
 /**
  * mmc_init_context_info() - init synchronization context
@@ -2895,6 +4399,13 @@ static int __init mmc_init(void)
 	if (!workqueue)
 		return -ENOMEM;
 
+	stats_workqueue = create_singlethread_workqueue("mmc_stats");
+	if (!stats_workqueue)
+		return -ENOMEM;
+
+	if (get_tamper_sf() == 1)
+		stats_interval = MMC_STATS_LOG_INTERVAL;
+
 	ret = mmc_register_bus();
 	if (ret)
 		goto destroy_workqueue;
@@ -2907,6 +4418,7 @@ static int __init mmc_init(void)
 	if (ret)
 		goto unregister_host_class;
 
+	spin_lock_init(&iolist_lock);
 	return 0;
 
 unregister_host_class:
@@ -2915,6 +4427,8 @@ unregister_bus:
 	mmc_unregister_bus();
 destroy_workqueue:
 	destroy_workqueue(workqueue);
+	if (stats_workqueue)
+		destroy_workqueue(stats_workqueue);
 
 	return ret;
 }

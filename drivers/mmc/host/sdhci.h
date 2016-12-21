@@ -553,6 +553,22 @@ struct sdhci_ops {
 					 struct mmc_card *card,
 					 unsigned int max_dtr, int host_drv,
 					 int card_drv, int *drv_type);
+	int	(*enhanced_strobe)(struct sdhci_host *host);
+	void	(*platform_bus_voting)(struct sdhci_host *host, u32 enable);
+	void	(*dump_vendor_regs)(struct sdhci_host *host);
+	int	(*config_auto_tuning_cmd)(struct sdhci_host *host,
+					  bool enable,
+					  u32 type);
+	int	(*enable_controller_clock)(struct sdhci_host *host);
+	void	(*clear_set_dumpregs)(struct sdhci_host *host, bool set);
+	void	(*enhanced_strobe_mask)(struct sdhci_host *host, bool set);
+	int	(*notify_load)(struct sdhci_host *host, enum mmc_load state);
+	int	(*get_cd)(struct sdhci_host *host);
+	void	(*reset_workaround)(struct sdhci_host *host, u32 enable);
+	void	(*init)(struct sdhci_host *host);
+	void	(*pre_req)(struct sdhci_host *host, struct mmc_request *req);
+	void	(*post_req)(struct sdhci_host *host, struct mmc_request *req);
+	unsigned int	(*get_current_limit)(struct sdhci_host *host);
 };
 
 #ifdef CONFIG_MMC_SDHCI_IO_ACCESSORS

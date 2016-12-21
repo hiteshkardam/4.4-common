@@ -103,6 +103,14 @@ static int mmc_decode_cid(struct mmc_card *card)
 		card->cid.serial	= UNSTUFF_BITS(resp, 16, 32);
 		card->cid.month		= UNSTUFF_BITS(resp, 12, 4);
 		card->cid.year		= UNSTUFF_BITS(resp, 8, 4) + 1997;
+
+		
+		if (card->cid.manfid == CID_MANFID_TOSHIBA ||
+		    card->cid.manfid == CID_MANFID_MICRON  ||
+		    card->cid.manfid == CID_MANFID_SAMSUNG ||
+		    card->cid.manfid == CID_MANFID_HYNIX)
+			card->cid.fwrev = UNSTUFF_BITS(resp, 48, 8);
+
 		break;
 
 	default:
@@ -177,6 +185,65 @@ static int mmc_decode_csd(struct mmc_card *card)
 	}
 
 	return 0;
+}
+
+/*
+ * Read extended CSD.
+ */
+int mmc_get_ext_csd(struct mmc_card *card, u8 **new_ext_csd)
+{
+	int err;
+	u8 *ext_csd;
+
+	BUG_ON(!card);
+	BUG_ON(!new_ext_csd);
+
+	*new_ext_csd = NULL;
+
+	if (!mmc_can_ext_csd(card))
+		return 0;
+
+	/*
+	 * As the ext_csd is so large and mostly unused, we don't store the
+	 * raw block in mmc_card.
+	 */
+	ext_csd = kmalloc(512, GFP_KERNEL);
+	if (!ext_csd) {
+		pr_err("%s: could not allocate a buffer to "
+			"receive the ext_csd.\n", mmc_hostname(card->host));
+		return -ENOMEM;
+	}
+
+	err = mmc_send_ext_csd(card, ext_csd);
+	if (err) {
+		kfree(ext_csd);
+		*new_ext_csd = NULL;
+
+		/* If the host or the card can't do the switch,
+		 * fail more gracefully. */
+		if ((err != -EINVAL)
+		 && (err != -ENOSYS)
+		 && (err != -EFAULT))
+			return err;
+
+		/*
+		 * High capacity cards should have this "magic" size
+		 * stored in their CSD.
+		 */
+		if (card->csd.capacity == (4096 * 512)) {
+			pr_err("%s: unable to read EXT_CSD "
+				"on a possible high capacity card. "
+				"Card will be ignored.\n",
+				mmc_hostname(card->host));
+		} else {
+			pr_warn("%s: unable to read EXT_CSD, performance might suffer\n",
+				mmc_hostname(card->host));
+			err = 0;
+		}
+	} else
+		*new_ext_csd = ext_csd;
+
+	return err;
 }
 
 static void mmc_select_card_type(struct mmc_card *card)
@@ -345,6 +412,85 @@ static int mmc_decode_ext_csd(struct mmc_card *card, u8 *ext_csd)
 	unsigned int part_size;
 	struct device_node *np;
 	bool broken_hpi = false;
+static void htc_mmc_show_cid_ext_csd(struct mmc_card *card, u8 *ext_csd)
+{
+	char *buf;
+	int i, j;
+	ssize_t n = 0;
+	char *check_fw;
+
+	if (mmc_card_mmc(card)) {
+		pr_info("%s: cid %08x%08x%08x%08x\n",
+			mmc_hostname(card->host),
+			card->raw_cid[0], card->raw_cid[1],
+			card->raw_cid[2], card->raw_cid[3]);
+		pr_info("%s: csd %08x%08x%08x%08x\n",
+			mmc_hostname(card->host),
+			card->raw_csd[0], card->raw_csd[1],
+			card->raw_csd[2], card->raw_csd[3]);
+
+		buf = kmalloc(512, GFP_KERNEL);
+		if (buf) {
+			for (i = 0; i < 32; i++) {
+				for (j = 511 - (16 * i); j >= 496 - (16 * i); j--)
+					n += sprintf(buf + n, "%02x", ext_csd[j]);
+				n += sprintf(buf + n, "\n");
+				pr_info("%s: ext_csd_%03d %s",
+					mmc_hostname(card->host), 511 - (16 * i), buf);
+				n = 0;
+			}
+		}
+		if (buf)
+			kfree(buf);
+
+		
+		if (card->cid.manfid == CID_MANFID_SANDISK ||
+		    card->cid.manfid == CID_MANFID_SANDISK_2) {
+			if (card->ext_csd.rev == 6)
+				card->cid.fwrev =
+				ext_csd[EXT_CSD_VENDOR_SPECIFIC_FIELDS_73] & 0x3F;
+			else if (card->ext_csd.rev > 6) { 
+				card->cid.fwrev =
+				ext_csd[EXT_CSD_VENDOR_SPECIFIC_FIELDS_258] - 0x30 ;
+
+				
+				check_fw = kmalloc(16, GFP_KERNEL);
+				if(check_fw) {
+					sprintf(check_fw, "%d%d%d%d%d%d",
+					ext_csd[254]-0x30, ext_csd[255]-0x30,
+					ext_csd[256]-0x30, ext_csd[257]-0x30,
+					ext_csd[258]-0x30, ext_csd[259]-0x30);
+				}
+				if(!strcmp(check_fw, "110224") ||
+					!strcmp(check_fw, "101149")) {
+					card->ext_csd.cmdq_support = 0;
+					card->ext_csd.cmdq_depth = 0;
+					card->ext_csd.barrier_support = 0;
+					card->ext_csd.cache_flush_policy = 0;
+				}
+				pr_info("%s: SanDisk: %s\n", mmc_hostname(card->host),
+					check_fw);
+				if(check_fw)
+					kfree(check_fw);
+			}
+
+		} else if (card->cid.manfid == CID_MANFID_MICRON) {
+			card->cid.fwrev = ext_csd[EXT_CSD_VENDOR_SPECIFIC_FIELDS_258];
+		}
+	}
+}
+
+#define MAX_CMDQ_DEPTH	16
+static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
+{
+	int err = 0, idx;
+	unsigned int part_size;
+	u8 q_depth;
+
+	BUG_ON(!card);
+
+	if (!ext_csd)
+		return 0;
 
 	/* Version is coded in the CSD_STRUCTURE byte in the EXT_CSD register */
 	card->ext_csd.raw_ext_csd_structure = ext_csd[EXT_CSD_STRUCTURE];
@@ -598,6 +744,52 @@ static int mmc_decode_ext_csd(struct mmc_card *card, u8 *ext_csd)
 			ext_csd[EXT_CSD_DEVICE_LIFE_TIME_EST_TYP_A];
 		card->ext_csd.device_life_time_est_typ_b =
 			ext_csd[EXT_CSD_DEVICE_LIFE_TIME_EST_TYP_B];
+	
+		/* Enhance Strobe is supported since v5.1 which rev should be
+		 * 8 but some eMMC devices can support it with rev 7. So handle
+		 * Enhance Strobe here.
+		 */
+		card->ext_csd.strobe_support = ext_csd[EXT_CSD_STROBE_SUPPORT];
+		card->ext_csd.cmdq_support = ext_csd[EXT_CSD_CMDQ_SUPPORT];
+		card->ext_csd.fw_version = ext_csd[EXT_CSD_FW_VERSION];
+		pr_info("%s: eMMC FW version: 0x%02x\n",
+			mmc_hostname(card->host),
+			card->ext_csd.fw_version);
+		if (card->ext_csd.cmdq_support) {
+			q_depth = ext_csd[EXT_CSD_CMDQ_DEPTH] + 1;
+			if (q_depth > MAX_CMDQ_DEPTH) {
+				pr_info("%s: CMDQ limit depth: %u -> %u\n",
+					mmc_hostname(card->host), q_depth, MAX_CMDQ_DEPTH);
+				card->ext_csd.cmdq_depth = MAX_CMDQ_DEPTH;
+			} else {
+				card->ext_csd.cmdq_depth = q_depth;
+			}
+			pr_info("%s: CMDQ supported: depth: %d\n",
+				mmc_hostname(card->host),
+				card->ext_csd.cmdq_depth);
+		}
+		card->ext_csd.barrier_support =
+			ext_csd[EXT_CSD_BARRIER_SUPPORT];
+		card->ext_csd.cache_flush_policy =
+			ext_csd[EXT_CSD_CACHE_FLUSH_POLICY];
+		pr_info("%s: cache barrier support %d flush policy %d\n",
+				mmc_hostname(card->host),
+				card->ext_csd.barrier_support,
+				card->ext_csd.cache_flush_policy);
+		card->ext_csd.enhanced_rpmb_supported =
+			(card->ext_csd.rel_param &
+			 EXT_CSD_WR_REL_PARAM_EN_RPMB_REL_WR);
+	} else {
+		card->ext_csd.cmdq_support = 0;
+		card->ext_csd.cmdq_depth = 0;
+		card->ext_csd.barrier_support = 0;
+		card->ext_csd.cache_flush_policy = 0;
+	}
+
+	card->ext_csd.ffu_mode_op = ext_csd[EXT_CSD_FFU_FEATURES];
+	printk("%s: ext_csd[EXT_CSD_FFU_FEATURES]=%x \n", __func__, ext_csd[EXT_CSD_FFU_FEATURES]);
+
+	htc_mmc_show_cid_ext_csd(card, ext_csd);
 	}
 out:
 	return err;
@@ -753,7 +945,41 @@ static ssize_t mmc_fwrev_show(struct device *dev,
 	}
 }
 
-static DEVICE_ATTR(fwrev, S_IRUGO, mmc_fwrev_show, NULL);
+static ssize_t htc_mmc_show_manf_name (struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	struct mmc_card *card = mmc_dev_to_card(dev);
+	int count = 0;
+
+	switch (card->cid.manfid) {
+	case CID_MANFID_SANDISK:
+	case CID_MANFID_SANDISK_2:
+		count = sprintf(buf, "Sandisk\n");
+		break;
+	case CID_MANFID_TOSHIBA:
+		count = sprintf(buf, "Toshiba\n");
+		break;
+	case CID_MANFID_MICRON:
+	case CID_MANFID_NUMONYX_MICRON:
+		count = sprintf(buf, "Micron\n");
+		break;
+	case CID_MANFID_SAMSUNG:
+		count = sprintf(buf, "Samsung\n");
+		break;
+	case CID_MANFID_HYNIX:
+		count = sprintf(buf, "Hynix\n");
+		break;
+	case CID_MANFID_KINGSTON:
+		count = sprintf(buf, "Kingston\n");
+		break;
+	default:
+		count = sprintf(buf, "Unknown\n");
+	}
+
+	return count;
+}
+DEVICE_ATTR(manf_name, S_IRUGO, htc_mmc_show_manf_name, NULL);
 
 static struct attribute *mmc_std_attrs[] = {
 	&dev_attr_cid.attr,
@@ -776,6 +1002,7 @@ static struct attribute *mmc_std_attrs[] = {
 	&dev_attr_enhanced_area_size.attr,
 	&dev_attr_raw_rpmb_size_mult.attr,
 	&dev_attr_rel_sectors.attr,
+	&dev_attr_manf_name.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mmc_std);

@@ -25,6 +25,19 @@
 #define MMC_QUEUE_BOUNCESZ	65536
 
 /*
+<<<<<<< HEAD
+=======
+ * Based on benchmark tests the default num of requests to trigger the write
+ * packing was determined, to keep the read latency as low as possible and
+ * manage to keep the high write throughput.
+ */
+#define DEFAULT_NUM_REQS_TO_START_PACK 17
+
+struct scatterlist	*cur_sg = NULL;
+struct scatterlist	*prev_sg = NULL;
+
+/*
+>>>>>>> 1ec4715f6f87... pme: mmc: Import HTC changes
  * Prepare a MMC request. This just filters out odd stuff.
  */
 static int mmc_prep_request(struct request_queue *q, struct request *req)
@@ -160,6 +173,7 @@ static struct scatterlist *mmc_alloc_sg(int sg_len, int *err)
 
 	return sg;
 }
+EXPORT_SYMBOL(mmc_alloc_sg);
 
 static void mmc_queue_setup_discard(struct request_queue *q,
 				    struct mmc_card *card)
@@ -286,6 +300,41 @@ int mmc_init_queue(struct mmc_queue *mq, struct mmc_card *card,
 		if (ret)
 			goto cleanup_queue;
 
+		if (mmc_card_sd(card)) {
+			if (!cur_sg) {
+				cur_sg = mmc_alloc_sg(host->max_segs, &ret);
+				mqrq_cur->sg = cur_sg;
+				if (ret == -ENOMEM)
+					goto cur_sg_alloc_failed;
+				else if (ret)
+					goto cleanup_queue;
+			} else {
+				mqrq_cur->sg = cur_sg;
+			}
+			if (!prev_sg) {
+				prev_sg = mmc_alloc_sg(host->max_segs, &ret);
+				mqrq_prev->sg = prev_sg;
+				if (ret == -ENOMEM)
+					goto prev_sg_alloc_failed;
+				else if (ret)
+					goto cleanup_queue;
+			} else {
+				mqrq_prev->sg = prev_sg;
+			}
+		} else {
+			mqrq_cur->sg = mmc_alloc_sg(host->max_segs, &ret);
+			if (ret == -ENOMEM)
+				goto cur_sg_alloc_failed;
+			else if (ret)
+				goto cleanup_queue;
+
+			mqrq_prev->sg = mmc_alloc_sg(host->max_segs, &ret);
+			if (ret == -ENOMEM)
+				goto prev_sg_alloc_failed;
+			else if (ret)
+				goto cleanup_queue;
+		}
+
 
 		mqrq_prev->sg = mmc_alloc_sg(host->max_segs, &ret);
 		if (ret)
@@ -296,6 +345,16 @@ int mmc_init_queue(struct mmc_queue *mq, struct mmc_card *card,
 
 	mq->thread = kthread_run(mmc_queue_thread, mq, "mmcqd/%d%s",
 		host->index, subname ? subname : "");
+
+	/* hook for pm qos legacy init */
+	if (card->host->ops->init)
+		card->host->ops->init(card->host);
+
+	if (mmc_card_sd(card))
+		mq->thread = kthread_run(mmc_queue_thread, mq, "sd-qd");
+	else
+		mq->thread = kthread_run(mmc_queue_thread, mq, "mmcqd/%d%s",
+				host->index, subname ? subname : "");
 
 	if (IS_ERR(mq->thread)) {
 		ret = PTR_ERR(mq->thread);
