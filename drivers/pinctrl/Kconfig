@@ -247,6 +247,17 @@ config PINCTRL_ZYNQ
 	  This selectes the pinctrl driver for Xilinx Zynq.
 
 source "drivers/pinctrl/bcm/Kconfig"
+
+config PINCTRL_TCA6418
+	bool "TCA6418 pinctrl driver"
+	depends on OF
+	select I2C
+	select PINMUX
+	select PINCONF
+	select GPIOLIB
+	help
+	  Say Y here to enable the TCA6418 pinctrl driver
+
 source "drivers/pinctrl/berlin/Kconfig"
 source "drivers/pinctrl/freescale/Kconfig"
 source "drivers/pinctrl/intel/Kconfig"
