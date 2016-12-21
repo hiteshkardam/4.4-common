@@ -538,6 +538,68 @@ config MEMORY_STATE_TIME
 	depends on PROFILING
 	help
 	  Memory time statistics exported to /sys/kernel/memory_state_time
+	
+#HTC_AUD_START
+config RT_REGMAP
+	bool "Richtek regmap"
+	default n
+	help
+	  Say Y to enable Richtek regmap"
+#HTC_AUD_END
+
+config USB_EXT_TYPE_C_PERICOM
+	tristate "USB Type-C charger detection support using Pericom chip"
+	depends on I2C && POWER_SUPPLY
+	help
+	  Enables support for the USB Type-C chargers using external
+	  pericom chip connected using I2C.
+
+	  This adds support for detecting USB Type-C chargers that
+	  can supply upto 3A Vbus current for charging.
+
+config USB_EXT_TYPE_C_TI
+	tristate "USB Type-C charger detection support using TI chip"
+	depends on I2C && POWER_SUPPLY
+	help
+	  Enables support for the USB Type-C chargers using external
+	  TI chip connected using I2C.
+
+	  This adds support for detecting USB Type-C chargers that
+	  can supply upto 3A Vbus current for charging.
+
+config TI_DRV2667
+	tristate "TI's DRV2667 haptic controller support"
+	depends on I2C
+	help
+	  The DRV2667 is a piezo haptic controller chip. It can drive
+	  piezo haptics either in digital mode or analog mode. This chip
+	  can be used in variety of devices to provide haptic support.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called ti_drv2667.
+
+config QPNP_MISC
+	tristate "QPNP Misc Peripheral"
+	depends on SPMI || MSM_SPMI
+	help
+	  Say 'y' here to include support for the QTI QPNP MISC
+	  peripheral. The MISC peripheral holds the USB ID interrupt
+	  and the driver provides an API to check if this interrupt
+	  is available on the current PMIC chip.
+
+config VIB_TRIGGERS
+    boolean "Vibrator trigger interface support"
+    default n
+    help
+      This option enables trigger support for the vibrator function.
+      These triggers allow kernel events to drive the vibrator. If
+      unsure, say N.
+
+config HTC_FLASHLIGHT
+    boolean "HTC Flashlight API"
+    default n
+    help
+      This option enables support for the htc_flahlight function.
 
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
@@ -551,4 +613,5 @@ source "drivers/misc/mic/Kconfig"
 source "drivers/misc/genwqe/Kconfig"
 source "drivers/misc/echo/Kconfig"
 source "drivers/misc/cxl/Kconfig"
+source "drivers/misc/fpr_FingerprintCard/Kconfig"
 endmenu
