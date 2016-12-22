@@ -868,6 +868,49 @@ struct dwc3 {
 
 	unsigned		tx_de_emphasis_quirk:1;
 	unsigned		tx_de_emphasis:2;
+	unsigned		is_drd:1;
+
+	/* Indicate if the gadget was powered by the otg driver */
+	unsigned		vbus_active:1;
+
+	/* Indicate if software connect was issued by the usb_gadget_driver */
+	unsigned		softconnect:1;
+
+	unsigned		nominal_elastic_buffer:1;
+	unsigned		err_evt_seen:1;
+	unsigned		usb3_u1u2_disable:1;
+	unsigned		enable_bus_suspend:1;
+	/* Indicate if need to disable controller internal clkgating */
+	unsigned		disable_clk_gating:1;
+
+	struct dwc3_gadget_events	dbg_gadget_events;
+
+	atomic_t		in_lpm;
+	int			tx_fifo_size;
+	bool			b_suspend;
+	unsigned		vbus_draw;
+
+	/* IRQ timing statistics */
+	int			irq;
+	struct tasklet_struct	bh;
+	unsigned long		irq_cnt;
+	unsigned long		ep_cmd_timeout_cnt;
+	unsigned                bh_completion_time[MAX_INTR_STATS];
+	unsigned                bh_handled_evt_cnt[MAX_INTR_STATS];
+	unsigned                bh_dbg_index;
+	ktime_t			irq_start_time[MAX_INTR_STATS];
+	ktime_t			t_pwr_evt_irq;
+	unsigned                irq_completion_time[MAX_INTR_STATS];
+	unsigned                irq_event_count[MAX_INTR_STATS];
+	unsigned                irq_dbg_index;
+
+	wait_queue_head_t	wait_linkstate;
+	
+	bool usb_disable;
+	struct work_struct disable_work;
+	void	(*notify_usb_disabled)(void);
+	
+	void			*dwc_ipc_log_ctxt;
 };
 
 /* -------------------------------------------------------------------------- */

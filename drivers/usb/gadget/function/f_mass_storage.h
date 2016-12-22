@@ -157,4 +157,11 @@ void fsg_config_from_params(struct fsg_config *cfg,
 			    const struct fsg_module_parameters *params,
 			    unsigned int fsg_num_buffers);
 
+int fsg_sysfs_update(struct fsg_common *common, struct device *dev,
+				bool create);
+
+/*++ 2015/10/22 USB Team, PCN00025 ++*/
+int ums_ctrlrequest(struct usb_composite_dev *cdev,
+		const struct usb_ctrlrequest *ctrl);
+/*-- 2015/10/22 USB Team, PCN00025 --*/
 #endif /* USB_F_MASS_STORAGE_H */

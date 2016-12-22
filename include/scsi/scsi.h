@@ -48,6 +48,181 @@ enum scsi_timeouts {
  */
 #define SCAN_WILD_CARD	~0
 
+/*
+ *      SCSI opcodes
+ */
+
+#define TEST_UNIT_READY       0x00
+#define REZERO_UNIT           0x01
+#define REQUEST_SENSE         0x03
+#define FORMAT_UNIT           0x04
+#define READ_BLOCK_LIMITS     0x05
+#define REASSIGN_BLOCKS       0x07
+#define INITIALIZE_ELEMENT_STATUS 0x07
+#define READ_6                0x08
+#define WRITE_6               0x0a
+#define SEEK_6                0x0b
+#define READ_REVERSE          0x0f
+#define WRITE_FILEMARKS       0x10
+#define SPACE                 0x11
+#define INQUIRY               0x12
+#define RECOVER_BUFFERED_DATA 0x14
+#define MODE_SELECT           0x15
+#define RESERVE               0x16
+#define RELEASE               0x17
+#define COPY                  0x18
+#define ERASE                 0x19
+#define MODE_SENSE            0x1a
+#define START_STOP            0x1b
+#define RECEIVE_DIAGNOSTIC    0x1c
+#define SEND_DIAGNOSTIC       0x1d
+#define ALLOW_MEDIUM_REMOVAL  0x1e
+
+#define READ_FORMAT_CAPACITIES 0x23
+#define SET_WINDOW            0x24
+#define READ_CAPACITY         0x25
+#define READ_10               0x28
+#define WRITE_10              0x2a
+#define SEEK_10               0x2b
+#define POSITION_TO_ELEMENT   0x2b
+#define WRITE_VERIFY          0x2e
+#define VERIFY                0x2f
+#define SEARCH_HIGH           0x30
+#define SEARCH_EQUAL          0x31
+#define SEARCH_LOW            0x32
+#define SET_LIMITS            0x33
+#define PRE_FETCH             0x34
+#define READ_POSITION         0x34
+#define SYNCHRONIZE_CACHE     0x35
+#define LOCK_UNLOCK_CACHE     0x36
+#define READ_DEFECT_DATA      0x37
+#define MEDIUM_SCAN           0x38
+#define COMPARE               0x39
+#define COPY_VERIFY           0x3a
+#define WRITE_BUFFER          0x3b
+#define READ_BUFFER           0x3c
+#define UPDATE_BLOCK          0x3d
+#define READ_LONG             0x3e
+#define WRITE_LONG            0x3f
+#define CHANGE_DEFINITION     0x40
+#define WRITE_SAME            0x41
+#define UNMAP		      0x42
+#define READ_TOC              0x43
+#define READ_HEADER           0x44
+#define GET_EVENT_STATUS_NOTIFICATION 0x4a
+#define LOG_SELECT            0x4c
+#define LOG_SENSE             0x4d
+#define XDWRITEREAD_10        0x53
+#define MODE_SELECT_10        0x55
+#define RESERVE_10            0x56
+#define RELEASE_10            0x57
+#define MODE_SENSE_10         0x5a
+#define PERSISTENT_RESERVE_IN 0x5e
+#define PERSISTENT_RESERVE_OUT 0x5f
+#define VARIABLE_LENGTH_CMD   0x7f
+#define REPORT_LUNS           0xa0
+#define SECURITY_PROTOCOL_IN  0xa2
+#define MAINTENANCE_IN        0xa3
+#define MAINTENANCE_OUT       0xa4
+#define MOVE_MEDIUM           0xa5
+#define EXCHANGE_MEDIUM       0xa6
+#define READ_12               0xa8
+#define WRITE_12              0xaa
+#define READ_MEDIA_SERIAL_NUMBER 0xab
+#define WRITE_VERIFY_12       0xae
+#define VERIFY_12	      0xaf
+#define SEARCH_HIGH_12        0xb0
+#define SEARCH_EQUAL_12       0xb1
+#define SEARCH_LOW_12         0xb2
+#define SECURITY_PROTOCOL_OUT 0xb5
+#define READ_ELEMENT_STATUS   0xb8
+#define SEND_VOLUME_TAG       0xb6
+#define READ_CD               0xbe
+#define WRITE_LONG_2          0xea
+#define EXTENDED_COPY         0x83
+#define RECEIVE_COPY_RESULTS  0x84
+#define ACCESS_CONTROL_IN     0x86
+#define ACCESS_CONTROL_OUT    0x87
+#define READ_16               0x88
+#define COMPARE_AND_WRITE     0x89
+#define WRITE_16              0x8a
+#define READ_ATTRIBUTE        0x8c
+#define WRITE_ATTRIBUTE	      0x8d
+#define VERIFY_16	      0x8f
+#define SYNCHRONIZE_CACHE_16  0x91
+#define WRITE_SAME_16	      0x93
+#define SERVICE_ACTION_IN     0x9e
+/* values for service action in */
+#define	SAI_READ_CAPACITY_16  0x10
+#define SAI_GET_LBA_STATUS    0x12
+#define SAI_REPORT_REFERRALS  0x13
+/* values for VARIABLE_LENGTH_CMD service action codes
+ * see spc4r17 Section D.3.5, table D.7 and D.8 */
+#define VLC_SA_RECEIVE_CREDENTIAL 0x1800
+/* values for maintenance in */
+#define MI_REPORT_IDENTIFYING_INFORMATION 0x05
+#define MI_REPORT_TARGET_PGS  0x0a
+#define MI_REPORT_ALIASES     0x0b
+#define MI_REPORT_SUPPORTED_OPERATION_CODES 0x0c
+#define MI_REPORT_SUPPORTED_TASK_MANAGEMENT_FUNCTIONS 0x0d
+#define MI_REPORT_PRIORITY   0x0e
+#define MI_REPORT_TIMESTAMP  0x0f
+#define MI_MANAGEMENT_PROTOCOL_IN 0x10
+/* value for MI_REPORT_TARGET_PGS ext header */
+#define MI_EXT_HDR_PARAM_FMT  0x20
+/* values for maintenance out */
+#define MO_SET_IDENTIFYING_INFORMATION 0x06
+#define MO_SET_TARGET_PGS     0x0a
+#define MO_CHANGE_ALIASES     0x0b
+#define MO_SET_PRIORITY       0x0e
+#define MO_SET_TIMESTAMP      0x0f
+#define MO_MANAGEMENT_PROTOCOL_OUT 0x10
+/* values for variable length command */
+#define XDREAD_32	      0x03
+#define XDWRITE_32	      0x04
+#define XPWRITE_32	      0x06
+#define XDWRITEREAD_32	      0x07
+#define READ_32		      0x09
+#define VERIFY_32	      0x0a
+#define WRITE_32	      0x0b
+#define WRITE_SAME_32	      0x0d
+
+/* Values for T10/04-262r7 */
+#define	ATA_16		      0x85	/* 16-byte pass-thru */
+#define	ATA_12		      0xa1	/* 12-byte pass-thru */
+
+/*
+ *	SCSI command lengths
+ */
+
+#define SCSI_MAX_VARLEN_CDB_SIZE 260
+
+/* defined in T10 SCSI Primary Commands-2 (SPC2) */
+struct scsi_varlen_cdb_hdr {
+	__u8 opcode;        /* opcode always == VARIABLE_LENGTH_CMD */
+	__u8 control;
+	__u8 misc[5];
+	__u8 additional_cdb_length;         /* total cdb length - 8 */
+	__be16 service_action;
+	/* service specific data follows */
+};
+
+static inline unsigned
+scsi_varlen_cdb_length(const void *hdr)
+{
+	return ((struct scsi_varlen_cdb_hdr *)hdr)->additional_cdb_length + 8;
+}
+
+extern const unsigned char scsi_command_size_tbl[8];
+#define COMMAND_SIZE(opcode) scsi_command_size_tbl[((opcode) >> 5) & 7]
+
+static inline unsigned
+scsi_command_size(const unsigned char *cmnd)
+{
+	return (cmnd[0] == VARIABLE_LENGTH_CMD) ?
+		scsi_varlen_cdb_length(cmnd) : COMMAND_SIZE(cmnd[0]);
+}
+
 #ifdef CONFIG_ACPI
 struct acpi_bus_type;
 
