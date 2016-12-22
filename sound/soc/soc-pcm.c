@@ -32,6 +32,7 @@
 #include <sound/soc-dpcm.h>
 #include <sound/initval.h>
 
+<<<<<<< HEAD
 #define DPCM_MAX_BE_USERS	8
 
 /*
@@ -52,6 +53,27 @@ static bool snd_soc_dai_stream_valid(struct snd_soc_dai *dai, int stream)
 	return codec_stream->rates;
 }
 
+static const struct snd_pcm_hardware no_host_hardware = {
+	.info			= SNDRV_PCM_INFO_MMAP |
+					SNDRV_PCM_INFO_MMAP_VALID |
+					SNDRV_PCM_INFO_INTERLEAVED |
+					SNDRV_PCM_INFO_PAUSE |
+					SNDRV_PCM_INFO_RESUME,
+	.formats		= SNDRV_PCM_FMTBIT_S16_LE |
+					SNDRV_PCM_FMTBIT_S32_LE,
+	.period_bytes_min	= PAGE_SIZE >> 2,
+	.period_bytes_max	= PAGE_SIZE >> 1,
+	.periods_min		= 2,
+	.periods_max		= 4,
+	/*
+	 * Increase the max buffer bytes as PAGE_SIZE bytes is
+	 * not enough to encompass all the scenarios sent by
+	 * userspapce.
+	 */
+	.buffer_bytes_max	= PAGE_SIZE * 4,
+};
+char former_device[100] = {0};
+
 /**
  * snd_soc_runtime_activate() - Increment active count for PCM runtime components
  * @rtd: ASoC PCM runtime that is activated
@@ -62,6 +84,7 @@ static bool snd_soc_dai_stream_valid(struct snd_soc_dai *dai, int stream)
  *
  * Must be called with the rtd->pcm_mutex being held
  */
+ 
 void snd_soc_runtime_activate(struct snd_soc_pcm_runtime *rtd, int stream)
 {
 	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
@@ -2147,8 +2170,11 @@ static int dpcm_fe_dai_prepare(struct snd_pcm_substream *substream)
 
 	/* there is no point preparing this FE if there are no BEs */
 	if (list_empty(&fe->dpcm[stream].be_clients)) {
-		dev_err(fe->dev, "ASoC: no backend DAIs enabled for %s\n",
-				fe->dai_link->name);
+		if(strcmp(fe->dai_link->name, former_device) != 0) { 
+			dev_err(fe->dev, "ASoC: no backend DAIs enabled for %s\n",
+					fe->dai_link->name);
+			strlcpy(former_device, fe->dai_link->name, sizeof(former_device)); 
+		}
 		ret = -EINVAL;
 		goto out;
 	}

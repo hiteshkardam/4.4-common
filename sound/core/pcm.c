@@ -517,7 +517,7 @@ static int snd_pcm_stream_proc_init(struct snd_pcm_str *pstr)
 	struct snd_info_entry *entry;
 	char name[16];
 
-	sprintf(name, "pcm%i%c", pcm->device, 
+	snprintf(name, sizeof(name), "pcm%i%c", pcm->device,
 		pstr->stream == SNDRV_PCM_STREAM_PLAYBACK ? 'p' : 'c');
 	if ((entry = snd_info_create_card_entry(pcm->card, name, pcm->card->proc_root)) == NULL)
 		return -ENOMEM;
@@ -575,7 +575,7 @@ static int snd_pcm_substream_proc_init(struct snd_pcm_substream *substream)
 
 	card = substream->pcm->card;
 
-	sprintf(name, "sub%i", substream->number);
+	snprintf(name, sizeof(name), "sub%i", substream->number);
 	if ((entry = snd_info_create_card_entry(card, name, substream->pstr->proc_root)) == NULL)
 		return -ENOMEM;
 	entry->mode = S_IFDIR | S_IRUGO | S_IXUGO;
@@ -1088,9 +1088,11 @@ static int snd_pcm_dev_register(struct snd_device *device)
 			continue;
 		switch (cidx) {
 		case SNDRV_PCM_STREAM_PLAYBACK:
+			snprintf(str, sizeof(str), "pcmC%iD%ip", pcm->card->number, pcm->device);//HTC_AUD klocwork
 			devtype = SNDRV_DEVICE_TYPE_PCM_PLAYBACK;
 			break;
 		case SNDRV_PCM_STREAM_CAPTURE:
+			snprintf(str, sizeof(str), "pcmC%iD%ic", pcm->card->number, pcm->device); //HTC_AUD klocwork
 			devtype = SNDRV_DEVICE_TYPE_PCM_CAPTURE;
 			break;
 		}

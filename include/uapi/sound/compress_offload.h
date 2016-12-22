@@ -186,6 +186,11 @@ struct snd_compr_metadata {
  *
  */
 #define SND_COMPR_TRIGGER_DRAIN 7 /*FIXME move this to pcm.h */
+#define SNDRV_COMPRESS_SET_NEXT_TRACK_PARAM\
+					_IOW('C', 0x80, union snd_codec_options)
+#define SNDRV_COMPRESS_ENABLE_EFFECT    _IOW('C', 0x70, int)
+
+#define SND_COMPR_TRIGGER_DRAIN 7 
 #define SND_COMPR_TRIGGER_NEXT_TRACK 8
 #define SND_COMPR_TRIGGER_PARTIAL_DRAIN 9
 #endif
